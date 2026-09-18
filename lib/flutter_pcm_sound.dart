@@ -36,16 +36,17 @@ class FlutterPcmSound {
   /// setup audio
   /// 'avAudioCategory' is for iOS only,
   /// enabled by default on other platforms
+  /// A null 'iosAudioCategory' leaves the AVAudioSession to the app.
   static Future<void> setup(
       {required int sampleRate,
       required int channelCount,
-      IosAudioCategory iosAudioCategory = IosAudioCategory.playback,
+      IosAudioCategory? iosAudioCategory = IosAudioCategory.playback,
       bool iosAllowBackgroundAudio = false,
       }) async {
     return await _invokeMethod('setup', {
       'sample_rate': sampleRate,
       'num_channels': channelCount,
-      'ios_audio_category': iosAudioCategory.name,
+      'ios_audio_category': iosAudioCategory?.name,
       'ios_allow_background_audio' : iosAllowBackgroundAudio,
     });
   }
