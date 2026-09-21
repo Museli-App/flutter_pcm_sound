@@ -149,9 +149,14 @@ public class FlutterPcmSoundPlugin implements
                         ? mAudioTrack.getBufferSizeInFrames()
                         : mMinBufferSize / (2 * mNumChannels);
 
-                    // reset
+                    // reset: total_feeds counts from this setup
                     mSamples.clear();
                     mShouldCleanup = false;
+                    synchronized (mSamples) {
+                        mTotalFeeds = 0;
+                    }
+                    mLastLowBufferFeed = 0;
+                    mLastZeroFeed = 0;
 
                     // start playback thread
                     playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
@@ -237,11 +242,13 @@ public class FlutterPcmSoundPlugin implements
     }
 
     /**
-     * Invokes the 'OnFeedSamples' callback with the number of remaining frames.
+     * Invokes the 'OnFeedSamples' callback with the number of remaining frames,
+     * and the number of feeds (since setup) that count includes.
      */
-    private void invokeFeedCallback(long remainingFrames) {
+    private void invokeFeedCallback(long remainingFrames, long totalFeeds) {
         Map<String, Object> response = new HashMap<>();
         response.put("remaining_frames", remainingFrames);
+        response.put("total_feeds", totalFeeds);
         mMethodChannel.invokeMethod("OnFeedSamples", response);
     }
 
@@ -307,7 +314,7 @@ public class FlutterPcmSoundPlugin implements
             if (isLowBufferEvent || isZeroCrossingEvent) {
                 if (isLowBufferEvent) {mLastLowBufferFeed = totalFeeds;}
                 if (isZeroCrossingEvent) {mLastZeroFeed = totalFeeds; drained = true;}
-                mainThreadHandler.post(() -> invokeFeedCallback(remainingFrames));
+                mainThreadHandler.post(() -> invokeFeedCallback(remainingFrames, totalFeeds));
             }
         }
 

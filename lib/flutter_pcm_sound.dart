@@ -23,6 +23,8 @@ class FlutterPcmSound {
 
   static Function(int)? onFeedSamplesCallback;
 
+  static Function(int remainingFrames, int totalFeeds)? onFeedTelemetryCallback;
+
   static LogLevel _logLevel = LogLevel.standard;
 
   static bool _needsStart = true;
@@ -77,6 +79,14 @@ class FlutterPcmSound {
     _channel.setMethodCallHandler(_methodCallHandler);
   }
 
+  /// As [setFeedCallback], plus `totalFeeds`: how many `feed()` calls since `setup`
+  /// the frame count includes, so a caller whose feeds outrun the callback can add
+  /// back the ones a reading missed. Native readings only: [start] never invokes it.
+  static void setFeedTelemetryCallback(Function(int remainingFrames, int totalFeeds)? callback) {
+    onFeedTelemetryCallback = callback;
+    _channel.setMethodCallHandler(_methodCallHandler);
+  }
+
   /// convenience function:
   ///   * if needed, invokes your feed callback to start playback
   ///   * returns true if your callback was invoked
@@ -124,6 +134,10 @@ class FlutterPcmSound {
         _needsStart = remainingFrames == 0;
         if (onFeedSamplesCallback != null) {
           onFeedSamplesCallback!(remainingFrames);
+        }
+        if (onFeedTelemetryCallback != null) {
+          int totalFeeds = call.arguments["total_feeds"];
+          onFeedTelemetryCallback!(remainingFrames, totalFeeds);
         }
         break;
       default:

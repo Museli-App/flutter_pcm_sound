@@ -138,6 +138,13 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 [self cleanup];
             }
 
+            // total_feeds counts from this setup
+            @synchronized (self.mSamples) {
+                self.mTotalFeeds = 0;
+            }
+            self.mLastLowBufferFeed = 0;
+            self.mLastZeroFeed = 0;
+
             // create
             AudioComponentDescription desc;
             desc.componentType = kAudioUnitType_Output;
@@ -224,8 +231,15 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             // and tell Dart the frames were consumed, prompting it to continue feeding.
             // This hides the temporary failure and keeps the API simple.
             if (!self.mIsAppActive && !self.mAllowBackgroundAudio) {
-                @synchronized (self.mSamples) {[self.mSamples setLength:0];}
-                [self.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:@{@"remaining_frames": @(0)}];
+                NSUInteger totalFeeds;
+                @synchronized (self.mSamples) {
+                    [self.mSamples setLength:0];
+                    // a dropped feed still counts: the caller sent it
+                    self.mTotalFeeds += 1;
+                    totalFeeds = self.mTotalFeeds;
+                }
+                [self.mMethodChannel invokeMethod:@"OnFeedSamples"
+                                        arguments:@{@"remaining_frames": @(0), @"total_feeds": @(totalFeeds)}];
                 result(@YES);
                 return;
             }
@@ -369,7 +383,7 @@ static OSStatus RenderCallback(void *inRefCon,
     if (isLowBufferEvent || isZeroCrossingEvent) {
         if(isLowBufferEvent) {instance.mLastLowBufferFeed = totalFeeds;}
         if(isZeroCrossingEvent) {instance.mLastZeroFeed = totalFeeds;}
-        NSDictionary *response = @{@"remaining_frames": @(remainingFrames)};
+        NSDictionary *response = @{@"remaining_frames": @(remainingFrames), @"total_feeds": @(totalFeeds)};
         dispatch_async(dispatch_get_main_queue(), ^{
             [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
         });
