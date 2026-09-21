@@ -37,18 +37,21 @@ class FlutterPcmSound {
   /// 'avAudioCategory' is for iOS only,
   /// enabled by default on other platforms
   /// A null 'iosAudioCategory' leaves the AVAudioSession to the app.
-  static Future<void> setup(
+  /// Returns the native output buffer's capacity in frames, which the feed
+  /// callback's count includes; 0 where the platform has none (iOS).
+  static Future<int> setup(
       {required int sampleRate,
       required int channelCount,
       IosAudioCategory? iosAudioCategory = IosAudioCategory.playback,
       bool iosAllowBackgroundAudio = false,
       }) async {
-    return await _invokeMethod('setup', {
+    final reply = await _invokeMethod<Object>('setup', {
       'sample_rate': sampleRate,
       'num_channels': channelCount,
       'ios_audio_category': iosAudioCategory?.name,
       'ios_allow_background_audio' : iosAllowBackgroundAudio,
     });
+    return reply is int ? reply : 0;
   }
 
   /// queue 16-bit samples (little endian)

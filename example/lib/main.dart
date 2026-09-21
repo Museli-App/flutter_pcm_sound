@@ -35,7 +35,7 @@ class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this); // register observer
 
     FlutterPcmSound.setLogLevel(LogLevel.verbose).onError(_showError);
-    FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1).onError(_showError);
+    FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: 1).then<void>((_) {}).onError(_showError);
     FlutterPcmSound.setFeedThreshold(sampleRate ~/ 10).onError(_showError);
     FlutterPcmSound.setFeedCallback(_onFeed);
   }

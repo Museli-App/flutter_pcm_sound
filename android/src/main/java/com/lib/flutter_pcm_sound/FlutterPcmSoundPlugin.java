@@ -25,6 +25,7 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
+import io.flutter.plugin.common.StandardMethodCodec;
 
 /**
  * FlutterPcmSoundPlugin implements a "one pedal" PCM sound playback mechanism.
@@ -36,6 +37,8 @@ public class FlutterPcmSoundPlugin implements
 {
     private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
     private static final int MAX_FRAMES_PER_BUFFER = 200;
+    private static final long DRAIN_POLL_MS = 10;
+    private static final int MAX_STALLED_POLLS = 10;
 
     private MethodChannel mMethodChannel;
     private Handler mainThreadHandler = new Handler(Looper.getMainLooper());
@@ -68,7 +71,9 @@ public class FlutterPcmSoundPlugin implements
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
         BinaryMessenger messenger = binding.getBinaryMessenger();
-        mMethodChannel = new MethodChannel(messenger, CHANNEL_NAME);
+        // Off the platform thread: a long UI frame must not stall feed().
+        mMethodChannel = new MethodChannel(
+            messenger, CHANNEL_NAME, StandardMethodCodec.INSTANCE, messenger.makeBackgroundTaskQueue());
         mMethodChannel.setMethodCallHandler(this);
     }
 
@@ -139,6 +144,11 @@ public class FlutterPcmSoundPlugin implements
                         return;
                     }
 
+                    // Track capacity: the backlog the caller must fill before playback starts.
+                    int bufferFrames = (Build.VERSION.SDK_INT >= 23)
+                        ? mAudioTrack.getBufferSizeInFrames()
+                        : mMinBufferSize / (2 * mNumChannels);
+
                     // reset
                     mSamples.clear();
                     mShouldCleanup = false;
@@ -150,7 +160,7 @@ public class FlutterPcmSoundPlugin implements
 
                     mDidSetup = true;
 
-                    result.success(true);
+                    result.success(bufferFrames);
                     break;
                 }
                 case "feed": {
@@ -243,18 +253,36 @@ public class FlutterPcmSoundPlugin implements
 
         mAudioTrack.play();
 
+        long framesWritten = 0;
+        // True once the zero event fired for the current feed: nothing left to report.
+        boolean drained = true;
+        long lastHead = -1;
+        int stalledPolls = 0;
+
         while (!mShouldCleanup) {
             ByteBuffer data = null;
             try {
-                // blocks indefinitely until new data
-                data = mSamples.take();
+                // Poll while the track still drains, so its zero event is reported.
+                data = drained ? mSamples.take() : mSamples.poll(DRAIN_POLL_MS, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 continue;
             }
 
-            // write
-            mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+            if (data != null) {
+                drained = false;
+                int written = mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+                if (written > 0) {framesWritten += written / (2 * mNumChannels);}
+            }
+
+            // Frames the mixer has not consumed yet; modular, so the 32-bit head may wrap.
+            long head = mAudioTrack.getPlaybackHeadPosition();
+            long inTrack = (framesWritten - head) & 0xFFFFFFFFL;
+
+            // A part-filled track never starts, so it never drains: stop polling it.
+            stalledPolls = (data == null && head == lastHead) ? stalledPolls + 1 : 0;
+            lastHead = head;
+            if (stalledPolls >= MAX_STALLED_POLLS) {drained = true;}
 
             long remainingFrames;
             long totalFeeds;
@@ -266,7 +294,7 @@ public class FlutterPcmSoundPlugin implements
                 for (ByteBuffer sampleBuffer : mSamples) {
                     totalBytes += sampleBuffer.remaining();
                 }
-                remainingFrames = totalBytes / (2 * mNumChannels);
+                remainingFrames = totalBytes / (2 * mNumChannels) + inTrack;
                 totalFeeds = mTotalFeeds;
                 feedThreshold = mFeedThreshold;
             }
@@ -278,7 +306,7 @@ public class FlutterPcmSoundPlugin implements
             // send events
             if (isLowBufferEvent || isZeroCrossingEvent) {
                 if (isLowBufferEvent) {mLastLowBufferFeed = totalFeeds;}
-                if (isZeroCrossingEvent) {mLastZeroFeed = totalFeeds;}
+                if (isZeroCrossingEvent) {mLastZeroFeed = totalFeeds; drained = true;}
                 mainThreadHandler.post(() -> invokeFeedCallback(remainingFrames));
             }
         }
