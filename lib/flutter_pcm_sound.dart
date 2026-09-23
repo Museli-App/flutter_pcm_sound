@@ -3,23 +3,57 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
 
-enum LogLevel {
-  none,
-  error,
-  standard,
-  verbose,
-}
+enum LogLevel { none, error, standard, verbose }
 
 // Apple Documentation: https://developer.apple.com/documentation/avfaudio/avaudiosessioncategory
 enum IosAudioCategory {
   soloAmbient, // same as ambient, but other apps will be muted. Other apps will be muted.
   ambient, // same as soloAmbient, but other apps are not muted.
   playback, // audio will play when phone is locked, like the music app
-  playAndRecord //
+  playAndRecord, //
+}
+
+/// A snapshot of one native output generation. Counters never include rejected feeds.
+class PcmOutputStatus {
+  final int generation;
+  final int acceptedFrames;
+  final int consumedFrames;
+  final int capacityFrames;
+  final int nativeBufferFrames;
+  final int totalFeeds;
+  /// Starvation episodes since setup, counted as Android's getUnderrunCount counts them.
+  final int underruns;
+  final String? failure;
+
+  const PcmOutputStatus({
+    required this.generation,
+    required this.acceptedFrames,
+    required this.consumedFrames,
+    required this.capacityFrames,
+    required this.nativeBufferFrames,
+    required this.totalFeeds,
+    required this.underruns,
+    this.failure,
+  });
+
+  factory PcmOutputStatus.fromMap(Map<dynamic, dynamic> map) => PcmOutputStatus(
+    generation: map['generation'] as int,
+    acceptedFrames: map['accepted_frames'] as int,
+    consumedFrames: map['consumed_frames'] as int,
+    capacityFrames: map['capacity_frames'] as int,
+    nativeBufferFrames: map['native_buffer_frames'] as int,
+    totalFeeds: map['total_feeds'] as int,
+    underruns: map['underruns'] as int,
+    failure: map['failure'] as String?,
+  );
+
+  int get remainingFrames => acceptedFrames - consumedFrames;
 }
 
 class FlutterPcmSound {
-  static const MethodChannel _channel = const MethodChannel('flutter_pcm_sound/methods');
+  static const MethodChannel _channel = const MethodChannel(
+    'flutter_pcm_sound/methods',
+  );
 
   static Function(int)? onFeedSamplesCallback;
 
@@ -41,32 +75,89 @@ class FlutterPcmSound {
   /// A null 'iosAudioCategory' leaves the AVAudioSession to the app.
   /// Returns the native output buffer's capacity in frames, which the feed
   /// callback's count includes; 0 where the platform has none (iOS).
-  static Future<int> setup(
-      {required int sampleRate,
-      required int channelCount,
-      IosAudioCategory? iosAudioCategory = IosAudioCategory.playback,
-      bool iosAllowBackgroundAudio = false,
-      }) async {
+  static Future<int> setup({
+    required int sampleRate,
+    required int channelCount,
+    IosAudioCategory? iosAudioCategory = IosAudioCategory.playback,
+    bool iosAllowBackgroundAudio = false,
+  }) async {
     final reply = await _invokeMethod<Object>('setup', {
       'sample_rate': sampleRate,
       'num_channels': channelCount,
       'ios_audio_category': iosAudioCategory?.name,
-      'ios_allow_background_audio' : iosAllowBackgroundAudio,
+      'ios_allow_background_audio': iosAllowBackgroundAudio,
     });
+    _needsStart = true;
     return reply is int ? reply : 0;
   }
+
+  /// Creates bounded output without unsolicited callbacks. Suitable for background isolates.
+  static Future<PcmOutputStatus> setupOutput({
+    required int sampleRate,
+    required int channelCount,
+    required int generation,
+    int capacityFrames = 5120,
+    IosAudioCategory? iosAudioCategory,
+    bool iosAllowBackgroundAudio = false,
+  }) async {
+    if (sampleRate < 8000 ||
+        sampleRate > 192000 ||
+        (channelCount != 1 && channelCount != 2) ||
+        capacityFrames < 512 ||
+        capacityFrames > 1920000) {
+      throw ArgumentError('Invalid PCM format or capacity');
+    }
+    final reply = await _invokeMethod<Map<dynamic, dynamic>>('setupOutput', {
+      'sample_rate': sampleRate,
+      'num_channels': channelCount,
+      'generation': generation,
+      'capacity_frames': capacityFrames,
+      'ios_audio_category': iosAudioCategory?.name,
+      'ios_allow_background_audio': iosAllowBackgroundAudio,
+    });
+    return PcmOutputStatus.fromMap(reply!);
+  }
+
+  static Future<PcmOutputStatus> feedWithStatus(
+    PcmArrayInt16 buffer, {
+    required int generation,
+  }) async {
+    final reply = await _invokeMethod<Map<dynamic, dynamic>>('feed', {
+      'buffer': buffer.bytes.buffer.asUint8List(
+        buffer.bytes.offsetInBytes,
+        buffer.bytes.lengthInBytes,
+      ),
+      'generation': generation,
+      'status': true,
+    });
+    return PcmOutputStatus.fromMap(reply!);
+  }
+
+  static Future<PcmOutputStatus> status({required int generation}) async =>
+      PcmOutputStatus.fromMap(
+        (await _invokeMethod<Map<dynamic, dynamic>>('status', {
+          'generation': generation,
+        }))!,
+      );
 
   /// queue 16-bit samples (little endian)
   static Future<void> feed(PcmArrayInt16 buffer) async {
     if (_needsStart && buffer.count != 0) _needsStart = false;
-    return await _invokeMethod('feed', {'buffer': buffer.bytes.buffer.asUint8List()});
+    return await _invokeMethod('feed', {
+      'buffer': buffer.bytes.buffer.asUint8List(
+        buffer.bytes.offsetInBytes,
+        buffer.bytes.lengthInBytes,
+      ),
+    });
   }
 
   /// set the threshold at which we call the
   /// feed callback. i.e. if we have less than X
   /// queued frames, the feed callback will be invoked
   static Future<void> setFeedThreshold(int threshold) async {
-    return await _invokeMethod('setFeedThreshold', {'feed_threshold': threshold});
+    return await _invokeMethod('setFeedThreshold', {
+      'feed_threshold': threshold,
+    });
   }
 
   /// Your feed callback is invoked _once_ for each of these events:
@@ -82,7 +173,9 @@ class FlutterPcmSound {
   /// As [setFeedCallback], plus `totalFeeds`: how many `feed()` calls since `setup`
   /// the frame count includes, so a caller whose feeds outrun the callback can add
   /// back the ones a reading missed. Native readings only: [start] never invokes it.
-  static void setFeedTelemetryCallback(Function(int remainingFrames, int totalFeeds)? callback) {
+  static void setFeedTelemetryCallback(
+    Function(int remainingFrames, int totalFeeds)? callback,
+  ) {
     onFeedTelemetryCallback = callback;
     _channel.setMethodCallHandler(_methodCallHandler);
   }
@@ -100,8 +193,11 @@ class FlutterPcmSound {
   }
 
   /// release all audio resources
-  static Future<void> release() async {
-    return await _invokeMethod('release');
+  static Future<void> release({int? generation}) async {
+    await _invokeMethod('release', {
+      if (generation != null) 'generation': generation,
+    });
+    _needsStart = true;
   }
 
   static Future<T?> _invokeMethod<T>(String method, [dynamic arguments]) async {
@@ -110,7 +206,8 @@ class FlutterPcmSound {
       if (method == 'feed') {
         Uint8List data = arguments['buffer'];
         if (data.lengthInBytes > 6) {
-          args = '(${data.lengthInBytes ~/ 2} samples) ${data.sublist(0, 6)} ...';
+          args =
+              '(${data.lengthInBytes ~/ 2} samples) ${data.sublist(0, 6)} ...';
         } else {
           args = '(${data.lengthInBytes ~/ 2} samples) $data';
         }
@@ -163,7 +260,7 @@ class PcmArrayInt16 {
   factory PcmArrayInt16.fromList(List<int> list) {
     var byteData = ByteData(list.length * 2);
     for (int i = 0; i < list.length; i++) {
-      byteData.setInt16(i * 2, list[i], Endian.host);
+      byteData.setInt16(i * 2, list[i], Endian.little);
     }
     return PcmArrayInt16(bytes: byteData);
   }
@@ -171,12 +268,12 @@ class PcmArrayInt16 {
   int get count => bytes.lengthInBytes ~/ 2;
 
   operator [](int idx) {
-    int vv = bytes.getInt16(idx * 2, Endian.host);
+    int vv = bytes.getInt16(idx * 2, Endian.little);
     return vv;
   }
 
   operator []=(int idx, int value) {
-    return bytes.setInt16(idx * 2, value, Endian.host);
+    return bytes.setInt16(idx * 2, value, Endian.little);
   }
 }
 
@@ -190,7 +287,16 @@ class MajorScale {
 
   // C Major Scale (Just Intonation)
   List<double> get scale {
-    List<double> c = [261.63, 294.33, 327.03, 348.83, 392.44, 436.05, 490.55, 523.25];
+    List<double> c = [
+      261.63,
+      294.33,
+      327.03,
+      348.83,
+      392.44,
+      436.05,
+      490.55,
+      523.25,
+    ];
     return [c[0]] + c + c.reversed.toList().sublist(0, c.length - 1);
   }
 
@@ -223,14 +329,21 @@ class MajorScale {
   }
 
   // generate a sine wave
-  List<int> cosineWave({int periods = 1, int sampleRate = 44100, double freq = 440, double volume = 0.5}) {
+  List<int> cosineWave({
+    int periods = 1,
+    int sampleRate = 44100,
+    double freq = 440,
+    double volume = 0.5,
+  }) {
     final period = 1.0 / freq;
     final nFramesPerPeriod = (period * sampleRate).toInt();
     final totalFrames = nFramesPerPeriod * periods;
     final step = math.pi * 2 / nFramesPerPeriod;
     List<int> data = List.filled(totalFrames, 0);
     for (int i = 0; i < totalFrames; i++) {
-      data[i] = (math.cos(step * (i % nFramesPerPeriod)) * volume * 32768).toInt() - 16384;
+      data[i] =
+          (math.cos(step * (i % nFramesPerPeriod)) * volume * 32768).toInt() -
+          16384;
     }
     return data;
   }
@@ -244,7 +357,12 @@ class MajorScale {
     List<int> frames = [];
     for (int i = 0; i < periods; i++) {
       _periodCount %= _periodsForScale;
-      frames += cosineWave(periods: 1, sampleRate: sampleRate, freq: scale[noteIdx], volume: volume);
+      frames += cosineWave(
+        periods: 1,
+        sampleRate: sampleRate,
+        freq: scale[noteIdx],
+        volume: volume,
+      );
       _periodCount++;
     }
     return frames;

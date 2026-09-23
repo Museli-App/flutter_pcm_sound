@@ -12,7 +12,7 @@ Pod::Spec.new do |s|
   s.author           = { 'Chip Weinberger' => 'weinbergerc@gmail.com' }
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
-  s.public_header_files = 'Classes/**/*.h'
+  s.public_header_files = 'Classes/FlutterPcmSoundPlugin.h'
   s.dependency 'FlutterMacOS'
   s.platform = :osx, '10.11'
   s.framework = 'CoreAudio'

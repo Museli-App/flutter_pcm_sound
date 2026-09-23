@@ -6,3 +6,4 @@ example/*
 !example/lib/
 !example/lib/main.dart
 !example/pubspec.yaml
+build/

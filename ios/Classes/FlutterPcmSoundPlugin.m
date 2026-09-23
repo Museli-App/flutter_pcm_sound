@@ -1,396 +1,263 @@
 #import "FlutterPcmSoundPlugin.h"
+#import "PcmRing.h"
 #import <AudioToolbox/AudioToolbox.h>
-
 #if TARGET_OS_IOS
 #import <AVFoundation/AVFoundation.h>
 #endif
 
-#define kOutputBus 0
-#define NAMESPACE @"flutter_pcm_sound"
+static const NSUInteger DefaultCapacity = 48000;
+static const uint64_t TelemetryPeriodNs = 10 * NSEC_PER_MSEC;
+static const uint64_t TelemetryLeewayNs = NSEC_PER_MSEC;
+static const uint32_t IdleStopTicks = 50; // 500 ms of telemetry ticks: outlasts the longest isolate stall seen (277 ms, debug).
+static OSStatus RenderCallback(void *, AudioUnitRenderActionFlags *, const AudioTimeStamp *,
+                               UInt32, UInt32, AudioBufferList *);
 
-typedef NS_ENUM(NSUInteger, LogLevel) {
-    none = 0,
-    error = 1,
-    standard = 2,
-    verbose = 3,
-};
-
-@interface FlutterPcmSoundPlugin ()
-@property(nonatomic) NSObject<FlutterPluginRegistrar> *registrar;
-@property(nonatomic) FlutterMethodChannel *mMethodChannel;
-@property(nonatomic) LogLevel mLogLevel;
-@property(nonatomic) AudioComponentInstance mAudioUnit;
-@property(nonatomic) NSMutableData *mSamples;
-@property(nonatomic) int mNumChannels; 
-@property(nonatomic) int mFeedThreshold; 
-@property(nonatomic) NSUInteger mTotalFeeds;
-@property(nonatomic) NSUInteger mLastLowBufferFeed;
-@property(nonatomic) NSUInteger mLastZeroFeed;
-@property(nonatomic) bool mDidSetup;
-@property(nonatomic) BOOL mIsAppActive;
-@property(nonatomic) BOOL mAllowBackgroundAudio;
+@interface FlutterPcmSoundPlugin () {
+@public
+    PcmRing _ring;
+    _Atomic(uint64_t) _underruns;
+    _Atomic(bool) _starved;
+    PcmIdle _idle; // only under @synchronized(self)
+}
+@property(nonatomic) FlutterMethodChannel *channel;
+@property(nonatomic) AudioComponentInstance unit;
+@property(nonatomic) dispatch_source_t telemetry;
+@property(nonatomic) uint64_t generation;
+@property(nonatomic) uint64_t feeds;
+@property(nonatomic) uint64_t lastLowFeed;
+@property(nonatomic) uint64_t lastZeroFeed;
+@property(nonatomic) NSUInteger threshold;
+@property(nonatomic) BOOL configured;
+@property(nonatomic) BOOL attached;
+@property(nonatomic) BOOL running;
+@property(nonatomic) BOOL active;
+@property(nonatomic) BOOL allowBackground;
+@property(nonatomic) BOOL legacyCallbacks;
+@property(nonatomic) NSString *failure;
 @end
 
 @implementation FlutterPcmSoundPlugin
-
-+ (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar
-{
-    FlutterMethodChannel *methodChannel = [FlutterMethodChannel methodChannelWithName:NAMESPACE @"/methods"
-                                                                    binaryMessenger:[registrar messenger]];
-
-    FlutterPcmSoundPlugin *instance = [[FlutterPcmSoundPlugin alloc] init];
-    instance.mMethodChannel = methodChannel;
-    instance.mLogLevel = verbose;
-    instance.mSamples = [NSMutableData new];
-    instance.mFeedThreshold = 8000;
-    instance.mTotalFeeds = 0;
-    instance.mLastLowBufferFeed = 0;
-    instance.mLastZeroFeed = 0;
-    instance.mDidSetup = false;
-    instance.mIsAppActive = true;
-    instance.mAllowBackgroundAudio = false;
-
++ (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
+    FlutterPcmSoundPlugin *instance = [FlutterPcmSoundPlugin new];
+    instance.active = YES;
+    instance.attached = YES;
+    instance.threshold = 8000;
+    instance.channel = [[FlutterMethodChannel alloc] initWithName:@"flutter_pcm_sound/methods"
+        binaryMessenger:registrar.messenger codec:FlutterStandardMethodCodec.sharedInstance
+        taskQueue:[registrar.messenger makeBackgroundTaskQueue]];
+    [registrar addMethodCallDelegate:instance channel:instance.channel];
 #if TARGET_OS_IOS
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserver:instance selector:@selector(onWillResignActive:) name:UIApplicationWillResignActiveNotification object:nil];
-    [nc addObserver:instance selector:@selector(onDidBecomeActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:instance selector:@selector(resign:) name:UIApplicationWillResignActiveNotification object:nil];
+    [nc addObserver:instance selector:@selector(activate:) name:UIApplicationDidBecomeActiveNotification object:nil];
 #endif
-
-    [registrar addMethodCallDelegate:instance channel:methodChannel];
 }
 
+// Starts a stopped unit that holds frames; a refused start keeps them for the next feed or activation.
+- (void)startIfQueued {
+    if (!self.configured || self.running || self.failure || !(self.active || self.allowBackground)) return;
+    uint64_t written = atomic_load_explicit(&_ring.written, memory_order_acquire);
+    if (written == atomic_load_explicit(&_ring.read, memory_order_acquire)) return;
+    atomic_store_explicit(&_starved, true, memory_order_relaxed);
+    if (AudioOutputUnitStart(_unit) != noErr) return;
+    self.running = YES;
+    PcmIdleReset(&_idle, written);
+    dispatch_source_set_timer(self.telemetry, dispatch_time(DISPATCH_TIME_NOW, TelemetryPeriodNs),
+        TelemetryPeriodNs, TelemetryLeewayNs);
+}
+
+- (void)resign:(NSNotification *)note { @synchronized(self) { self.active = NO; } }
+- (void)activate:(NSNotification *)note { @synchronized(self) { self.active = YES; [self startIfQueued]; } }
+
+- (NSDictionary *)status {
+    uint64_t accepted = self.configured ? atomic_load_explicit(&_ring.written, memory_order_acquire) : 0;
+    uint64_t consumed = self.configured ? atomic_load_explicit(&_ring.read, memory_order_acquire) : 0;
+    return @{@"generation": @(self.generation), @"accepted_frames": @(accepted),
+        @"consumed_frames": @(consumed), @"remaining_frames": @(accepted - consumed),
+        @"capacity_frames": @(self.configured ? _ring.capacity : 0), @"native_buffer_frames": @0,
+        @"total_feeds": @(self.feeds), @"underruns": @(atomic_load_explicit(&_underruns, memory_order_relaxed)),
+        @"failure": self.failure ?: NSNull.null};
+}
+
+- (FlutterError *)error:(NSString *)code message:(NSString *)message {
+    return [FlutterError errorWithCode:code message:message details:@{@"generation": @(self.generation)}];
+}
+
+- (FlutterError *)checkOSStatus:(OSStatus)status operation:(NSString *)operation {
+    if (status == noErr) return nil;
+    self.failure = [NSString stringWithFormat:@"%@ failed (%d)", operation, (int)status];
+    return [self error:@"AudioUnitError" message:self.failure];
+}
+
+- (void)cleanup {
+    if (self.telemetry) { dispatch_source_cancel(self.telemetry); self.telemetry = nil; }
+    if (_unit) {
+        AudioOutputUnitStop(_unit);
+        AudioUnitUninitialize(_unit);
+        AudioComponentInstanceDispose(_unit);
+        _unit = NULL;
+    }
+    // Stop/dispose synchronizes with the last callback before storage is freed.
+    if (_ring.bytes) PcmRingDispose(&_ring);
+    self.configured = self.running = NO;
+}
+
+- (FlutterError *)setup:(NSDictionary *)args legacy:(BOOL)legacy {
+    NSInteger rate = [args[@"sample_rate"] integerValue];
+    NSInteger channels = [args[@"num_channels"] integerValue];
+    NSInteger capacity = args[@"capacity_frames"] ? [args[@"capacity_frames"] integerValue] : DefaultCapacity;
+    if (rate < 8000 || rate > 192000 || (channels != 1 && channels != 2) || capacity < 512 || capacity > 1920000)
+        return [self error:@"Arguments" message:@"Invalid PCM format or capacity"];
+    [self cleanup];
+    self.generation = args[@"generation"] ? [args[@"generation"] unsignedLongLongValue] : self.generation + 1;
+    self.feeds = self.lastLowFeed = self.lastZeroFeed = 0;
+    self.failure = nil;
+    self.allowBackground = [args[@"ios_allow_background_audio"] boolValue];
+    self.legacyCallbacks = legacy;
+    atomic_store(&_underruns, 0);
 #if TARGET_OS_IOS
-- (void)onWillResignActive:(NSNotification *)note {
-  self.mIsAppActive = NO;
-}
-
-- (void)onDidBecomeActive:(NSNotification *)note {
-  self.mIsAppActive = YES;
-}
+    id categoryName = args[@"ios_audio_category"];
+    if ([categoryName isKindOfClass:NSString.class]) {
+        NSDictionary *categories = @{@"ambient": AVAudioSessionCategoryAmbient,
+            @"soloAmbient": AVAudioSessionCategorySoloAmbient, @"playback": AVAudioSessionCategoryPlayback,
+            @"playAndRecord": AVAudioSessionCategoryPlayAndRecord};
+        NSError *error = nil;
+        [AVAudioSession.sharedInstance setCategory:categories[categoryName] ?: AVAudioSessionCategoryPlayback error:&error];
+        if (!error) [AVAudioSession.sharedInstance setActive:YES error:&error];
+        if (error) return [self error:@"AVAudioSessionError" message:error.localizedDescription];
+    }
 #endif
-
-- (void)handleMethodCall:(FlutterMethodCall *)call result:(FlutterResult)result
-{
-    @try
-    {
-        if ([@"setLogLevel" isEqualToString:call.method])
-        {
-            NSDictionary *args = (NSDictionary*)call.arguments;
-            NSNumber *logLevelNumber  = args[@"log_level"];
-
-            self.mLogLevel = (LogLevel)[logLevelNumber integerValue];
-
-            result(@YES);
+    if (!PcmRingInit(&_ring, (size_t)capacity, channels * sizeof(int16_t)))
+        return [self error:@"Memory" message:@"Cannot allocate PCM ring"];
+    AudioComponentDescription desc = {0};
+    desc.componentType = kAudioUnitType_Output;
+#if TARGET_OS_IOS
+    desc.componentSubType = kAudioUnitSubType_RemoteIO;
+#else
+    desc.componentSubType = kAudioUnitSubType_DefaultOutput;
+#endif
+    desc.componentManufacturer = kAudioUnitManufacturer_Apple;
+    AudioComponent component = AudioComponentFindNext(NULL, &desc);
+    if (!component) { [self cleanup]; return [self error:@"AudioUnitError" message:@"No output component"]; }
+    FlutterError *error = [self checkOSStatus:AudioComponentInstanceNew(component, &_unit) operation:@"create"];
+    AudioStreamBasicDescription format = {0};
+    format.mSampleRate = rate;
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    format.mFramesPerPacket = 1;
+    format.mChannelsPerFrame = (UInt32)channels;
+    format.mBitsPerChannel = 16;
+    format.mBytesPerFrame = format.mBytesPerPacket = (UInt32)channels * 2;
+    if (!error) error = [self checkOSStatus:AudioUnitSetProperty(_unit, kAudioUnitProperty_StreamFormat,
+        kAudioUnitScope_Input, 0, &format, sizeof(format)) operation:@"format"];
+    AURenderCallbackStruct callback = {RenderCallback, (__bridge void *)self};
+    if (!error) error = [self checkOSStatus:AudioUnitSetProperty(_unit, kAudioUnitProperty_SetRenderCallback,
+        kAudioUnitScope_Global, 0, &callback, sizeof(callback)) operation:@"callback"];
+    if (!error) error = [self checkOSStatus:AudioUnitInitialize(_unit) operation:@"initialize"];
+    if (error) { [self cleanup]; return error; }
+    self.configured = YES;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    self.telemetry = timer;
+    uint64_t generation = self.generation;
+    __weak FlutterPcmSoundPlugin *weakSelf = self;
+    dispatch_source_set_timer(timer, DISPATCH_TIME_FOREVER, TelemetryPeriodNs, TelemetryLeewayNs);
+    dispatch_source_set_event_handler(timer, ^{
+        FlutterPcmSoundPlugin *owner = weakSelf;
+        if (!owner) return;
+        @synchronized(owner) {
+            if (!owner.configured || owner.generation != generation) return;
+            uint64_t written = atomic_load_explicit(&owner->_ring.written, memory_order_acquire);
+            uint64_t read = atomic_load_explicit(&owner->_ring.read, memory_order_acquire);
+            uint64_t remaining = written - read;
+            BOOL low = remaining <= owner.threshold && owner.lastLowFeed != owner.feeds;
+            BOOL zero = remaining == 0 && owner.lastZeroFeed != owner.feeds;
+            if (low) owner.lastLowFeed = owner.feeds;
+            if (zero) owner.lastZeroFeed = owner.feeds;
+            if (owner.running && PcmIdleExpired(&owner->_idle, written, read, IdleStopTicks)) {
+                FlutterError *error = [owner checkOSStatus:AudioOutputUnitStop(owner.unit) operation:@"stop"];
+                if (!error) owner.running = NO;
+                dispatch_source_set_timer(owner.telemetry, DISPATCH_TIME_FOREVER, TelemetryPeriodNs, TelemetryLeewayNs);
+            }
+            if (owner.legacyCallbacks && (low || zero)) {
+                NSDictionary *status = [owner status];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @synchronized(owner) {
+                        if (owner.configured && owner.generation == generation)
+                            [owner.channel invokeMethod:@"OnFeedSamples" arguments:status];
+                    }
+                });
+            }
         }
-        else if ([@"setup" isEqualToString:call.method])
-        {
-            NSDictionary *args = (NSDictionary*)call.arguments;
-            NSNumber *sampleRate       = args[@"sample_rate"];
-            NSNumber *numChannels      = args[@"num_channels"];
-#if TARGET_OS_IOS
-            NSString *iosAudioCategory = args[@"ios_audio_category"];
-            self.mAllowBackgroundAudio = [args[@"ios_allow_background_audio"] boolValue];
-#endif
+    });
+    dispatch_resume(timer);
+    return nil;
+}
 
-            self.mNumChannels = [numChannels intValue];
-
-#if TARGET_OS_IOS
-            // nil (Dart null): the app owns the AVAudioSession, leave it untouched.
-            if ([iosAudioCategory isKindOfClass:[NSString class]]) {
-                // iOS audio category
-                AVAudioSessionCategory category = AVAudioSessionCategorySoloAmbient;
-                if ([iosAudioCategory isEqualToString:@"ambient"]) {
-                    category = AVAudioSessionCategoryAmbient;
-                } else if ([iosAudioCategory isEqualToString:@"soloAmbient"]) {
-                    category = AVAudioSessionCategorySoloAmbient;
-                } else if ([iosAudioCategory isEqualToString:@"playback"]) {
-                    category = AVAudioSessionCategoryPlayback;
+- (void)handleMethodCall:(FlutterMethodCall *)call result:(FlutterResult)result {
+    @synchronized(self) {
+        @try {
+            if (!self.attached) { result([self error:@"Detached" message:@"Plugin detached"]); return; }
+            NSDictionary *args = [call.arguments isKindOfClass:NSDictionary.class] ? call.arguments : @{};
+            NSString *method = call.method;
+            if ([method isEqualToString:@"setup"] || [method isEqualToString:@"setupOutput"]) {
+                BOOL legacy = [method isEqualToString:@"setup"];
+                FlutterError *error = [self setup:args legacy:legacy];
+                result(error ?: (legacy ? (id)@0 : [self status]));
+            } else if ([method isEqualToString:@"release"]) {
+                // Releasing an older generation is a harmless no-op, as on Android.
+                if (args[@"generation"] && [args[@"generation"] unsignedLongLongValue] != self.generation) {
+                    result(@NO); return;
                 }
-                else if ([iosAudioCategory isEqualToString:@"playAndRecord"]) {
-                    category = AVAudioSessionCategoryPlayAndRecord;
-                }
-                
-                // Set the AVAudioSession category based on the string value
-                NSError *error = nil;
-                [[AVAudioSession sharedInstance] setCategory:category error:&error];
-                if (error) {
-                    NSLog(@"Error setting AVAudioSession category: %@", error);
-                    result([FlutterError errorWithCode:@"AVAudioSessionError" 
-                                            message:@"Error setting AVAudioSession category" 
-                                            details:[error localizedDescription]]);
-                    return;
-                }
-                
-                // Activate the audio session
-                [[AVAudioSession sharedInstance] setActive:YES error:&error];
-                if (error) {
-                    NSLog(@"Error activating AVAudioSession: %@", error);
-                    result([FlutterError errorWithCode:@"AVAudioSessionError" 
-                                            message:@"Error activating AVAudioSession" 
-                                            details:[error localizedDescription]]);
-                    return;
-                }
-            }
-#endif
-
-            // cleanup
-            if (_mAudioUnit != nil) {
-                [self cleanup];
-            }
-
-            // total_feeds counts from this setup
-            @synchronized (self.mSamples) {
-                self.mTotalFeeds = 0;
-            }
-            self.mLastLowBufferFeed = 0;
-            self.mLastZeroFeed = 0;
-
-            // create
-            AudioComponentDescription desc;
-            desc.componentType = kAudioUnitType_Output;
-#if TARGET_OS_IOS
-            desc.componentSubType = kAudioUnitSubType_RemoteIO;
-#else // MacOS
-            desc.componentSubType = kAudioUnitSubType_DefaultOutput;
-#endif
-            desc.componentFlags = 0;
-            desc.componentFlagsMask = 0;
-            desc.componentManufacturer = kAudioUnitManufacturer_Apple;
-
-            AudioComponent inputComponent = AudioComponentFindNext(NULL, &desc);
-            OSStatus status = AudioComponentInstanceNew(inputComponent, &_mAudioUnit);
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioComponentInstanceNew failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
-            }
-
-            // set stream format
-            AudioStreamBasicDescription audioFormat;
-            audioFormat.mSampleRate = [sampleRate intValue];
-            audioFormat.mFormatID = kAudioFormatLinearPCM;
-            audioFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-            audioFormat.mFramesPerPacket = 1;
-            audioFormat.mChannelsPerFrame = self.mNumChannels;
-            audioFormat.mBitsPerChannel = 16;
-            audioFormat.mBytesPerFrame = self.mNumChannels * (audioFormat.mBitsPerChannel / 8);
-            audioFormat.mBytesPerPacket = audioFormat.mBytesPerFrame * audioFormat.mFramesPerPacket;
-
-            status = AudioUnitSetProperty(_mAudioUnit,
-                                    kAudioUnitProperty_StreamFormat,
-                                    kAudioUnitScope_Input,
-                                    kOutputBus,
-                                    &audioFormat,
-                                    sizeof(audioFormat));
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioUnitSetProperty StreamFormat failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
-            }
-
-            // set callback
-            AURenderCallbackStruct callback;
-            callback.inputProc = RenderCallback;
-            callback.inputProcRefCon = (__bridge void *)(self);
-
-            status = AudioUnitSetProperty(_mAudioUnit,
-                                kAudioUnitProperty_SetRenderCallback,
-                                kAudioUnitScope_Global,
-                                kOutputBus,
-                                &callback,
-                                sizeof(callback));
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioUnitSetProperty SetRenderCallback failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
-            }
-
-            // initialize
-            status = AudioUnitInitialize(_mAudioUnit);
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioUnitInitialize failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
-            }
-
-            self.mDidSetup = true;
-            
-            result(@YES);
-        }
-        else if ([@"feed" isEqualToString:call.method])
-        {
-            // setup check
-            if (self.mDidSetup == false) {
-                result([FlutterError errorWithCode:@"Setup" message:@"must call setup first" details:nil]);
-                return;
-            }
-
-            // If background audio is not allowed, feeding immediately after a lock→unlock
-            // can cause AudioOutputUnitStart to fail with code 561015905 because the app is not
-            // fully active yet. Rather than surfacing this transient error, we report success
-            // and tell Dart the frames were consumed, prompting it to continue feeding.
-            // This hides the temporary failure and keeps the API simple.
-            if (!self.mIsAppActive && !self.mAllowBackgroundAudio) {
-                NSUInteger totalFeeds;
-                @synchronized (self.mSamples) {
-                    [self.mSamples setLength:0];
-                    // a dropped feed still counts: the caller sent it
-                    self.mTotalFeeds += 1;
-                    totalFeeds = self.mTotalFeeds;
-                }
-                [self.mMethodChannel invokeMethod:@"OnFeedSamples"
-                                        arguments:@{@"remaining_frames": @(0), @"total_feeds": @(totalFeeds)}];
+                [self cleanup]; result(@YES);
+            } else if ([method isEqualToString:@"setLogLevel"]) {
                 result(@YES);
-                return;
-            }
-
-            NSDictionary *args = (NSDictionary*)call.arguments;
-            FlutterStandardTypedData *buffer = args[@"buffer"];
-
-            @synchronized (self.mSamples) {
-                [self.mSamples appendData:buffer.data];
-                self.mTotalFeeds += 1;
-            }
-
-            // start
-            OSStatus status = AudioOutputUnitStart(_mAudioUnit);
-            if (status != noErr) {
-                NSString* message = [NSString stringWithFormat:@"AudioOutputUnitStart failed. OSStatus: %@", @(status)];
-                result([FlutterError errorWithCode:@"AudioUnitError" message:message details:nil]);
-                return;
-            }
-
-            result(@YES);
-        }
-        else if ([@"setFeedThreshold" isEqualToString:call.method])
-        {
-            NSDictionary *args = (NSDictionary*)call.arguments;
-            NSNumber *feedThreshold = args[@"feed_threshold"];
-
-            @synchronized (self.mSamples) {
-                self.mFeedThreshold = [feedThreshold intValue];
-            }
-
-            result(@YES);
-        }
-        else if([@"release" isEqualToString:call.method])
-        {
+            } else if ([method isEqualToString:@"setFeedThreshold"]) {
+                self.threshold = MAX(0, [args[@"feed_threshold"] integerValue]); result(@YES);
+            } else if ([method isEqualToString:@"status"] || [method isEqualToString:@"feed"]) {
+                if (!self.configured) { result([self error:@"Setup" message:@"Must call setup first"]); return; }
+                if (args[@"generation"] && [args[@"generation"] unsignedLongLongValue] != self.generation) {
+                    result([self error:@"Generation" message:@"Stale output generation"]); return;
+                }
+                if ([method isEqualToString:@"status"]) { result([self status]); return; }
+                FlutterStandardTypedData *buffer = args[@"buffer"];
+                if (![buffer isKindOfClass:FlutterStandardTypedData.class] || buffer.data.length % _ring.frameBytes) {
+                    result([self error:@"Arguments" message:@"PCM data is not frame aligned"]); return;
+                }
+                if (self.failure) { result([self error:@"AudioUnitError" message:self.failure]); return; }
+                size_t frames = buffer.data.length / _ring.frameBytes;
+                if (!PcmRingWrite(&_ring, buffer.data.bytes, frames)) {
+                    result([self error:@"Capacity" message:@"PCM capacity exceeded"]); return;
+                }
+                self.feeds++;
+                // A running unit plays on while inactive; only a start waits, since one just after unlock
+                // fails (561015905).
+                [self startIfQueued];
+                result([args[@"status"] boolValue] ? [self status] : (id)@YES);
+            } else result(FlutterMethodNotImplemented);
+        } @catch (NSException *error) {
             [self cleanup];
-            result(@YES);
-        }
-        else
-        {
-            result([FlutterError errorWithCode:@"functionNotImplemented" message:call.method details:nil]);
-        }
-    }
-    @catch (NSException *e)
-    {
-        NSString *stackTrace = [[e callStackSymbols] componentsJoinedByString:@"\n"];
-        NSDictionary *details = @{@"stackTrace": stackTrace};
-        result([FlutterError errorWithCode:@"iosException" message:[e reason] details:details]);
-    }
-}
-
-- (void)cleanup
-{
-    if (_mAudioUnit != nil) {
-        AudioOutputUnitStop(_mAudioUnit);
-        AudioUnitUninitialize(_mAudioUnit);
-        AudioComponentInstanceDispose(_mAudioUnit);
-        _mAudioUnit = nil;
-        self.mDidSetup = false;
-    }
-    @synchronized (self.mSamples) {
-        [self.mSamples setLength:0];
-    }
-}
-
-- (void)stopAudioUnit
-{
-    if (_mAudioUnit != nil) {
-        UInt32 isRunning = 0;
-        UInt32 size = sizeof(isRunning);
-        OSStatus status = AudioUnitGetProperty(_mAudioUnit,
-                                            kAudioOutputUnitProperty_IsRunning,
-                                            kAudioUnitScope_Global,
-                                            0,
-                                            &isRunning,
-                                            &size);
-        if (status != noErr) {
-            NSLog(@"AudioUnitGetProperty IsRunning failed. OSStatus: %@", @(status));
-            return;
-        }
-        if (isRunning) {
-            status = AudioOutputUnitStop(_mAudioUnit);
-            if (status != noErr) {
-                NSLog(@"AudioOutputUnitStop failed. OSStatus: %@", @(status));
-            } else {
-                NSLog(@"AudioUnit stopped because no more samples");
-            }
+            result([self error:@"AudioUnitError" message:error.reason]);
         }
     }
 }
 
+- (void)detachFromEngineForRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
+    @synchronized(self) { self.attached = NO; [self cleanup]; }
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+- (void)dealloc {
+    [self cleanup];
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+@end
 
-static OSStatus RenderCallback(void *inRefCon,
-                               AudioUnitRenderActionFlags *ioActionFlags,
-                               const AudioTimeStamp *inTimeStamp,
-                               UInt32 inBusNumber,
-                               UInt32 inNumberFrames,
-                               AudioBufferList *ioData)
-{
-    FlutterPcmSoundPlugin *instance = (__bridge FlutterPcmSoundPlugin *)(inRefCon);
-
-    NSUInteger totalFeeds = 0;
-    NSUInteger remainingFrames;
-    NSUInteger feedThreshold = 0;
-
-    @synchronized (instance.mSamples) {
-
-        // clear
-        memset(ioData->mBuffers[0].mData, 0, ioData->mBuffers[0].mDataByteSize);
-
-        NSUInteger bytesToCopy = MIN(ioData->mBuffers[0].mDataByteSize, [instance.mSamples length]);
-        
-        // provide samples
-        memcpy(ioData->mBuffers[0].mData, [instance.mSamples bytes], bytesToCopy);
-
-        // pop front bytes
-        NSRange range = NSMakeRange(0, bytesToCopy);
-        [instance.mSamples replaceBytesInRange:range withBytes:NULL length:0];
-
-        // grab shared data
-        remainingFrames = [instance.mSamples length] / (instance.mNumChannels * sizeof(short));
-        totalFeeds = instance.mTotalFeeds;
-        feedThreshold = (NSUInteger)instance.mFeedThreshold;
-    }
-
-    // check for events
-    BOOL isLowBufferEvent = (remainingFrames <= feedThreshold) && (instance.mLastLowBufferFeed != totalFeeds);
-    BOOL isZeroCrossingEvent = (remainingFrames == 0) && (instance.mLastZeroFeed != totalFeeds);
-
-    // stop running, if needed
-    if (remainingFrames == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @synchronized (instance.mSamples) { // re-check
-                if ([instance.mSamples length] != 0) {return;}
-            }
-            [instance stopAudioUnit];
-        });
-    }
-
-    // send events
-    if (isLowBufferEvent || isZeroCrossingEvent) {
-        if(isLowBufferEvent) {instance.mLastLowBufferFeed = totalFeeds;}
-        if(isZeroCrossingEvent) {instance.mLastZeroFeed = totalFeeds;}
-        NSDictionary *response = @{@"remaining_frames": @(remainingFrames), @"total_feeds": @(totalFeeds)};
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [instance.mMethodChannel invokeMethod:@"OnFeedSamples" arguments:response];
-        });
-    }
-
+static OSStatus RenderCallback(void *context, AudioUnitRenderActionFlags *flags,
+    const AudioTimeStamp *time, UInt32 bus, UInt32 frames, AudioBufferList *data) {
+    __unsafe_unretained FlutterPcmSoundPlugin *owner = (__bridge FlutterPcmSoundPlugin *)context;
+    PcmRing *ring = &owner->_ring;
+    size_t requested = data->mBuffers[0].mDataByteSize / ring->frameBytes;
+    size_t read = PcmRingRead(ring, data->mBuffers[0].mData, requested);
+    if (PcmUnderrunEdge(&owner->_starved, read, requested)) atomic_fetch_add_explicit(&owner->_underruns, 1, memory_order_relaxed);
     return noErr;
 }
-
-
-@end

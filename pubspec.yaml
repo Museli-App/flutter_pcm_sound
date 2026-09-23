@@ -22,3 +22,7 @@ flutter:
       macos:
         pluginClass: FlutterPcmSoundPlugin
 
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

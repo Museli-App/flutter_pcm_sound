@@ -1,339 +1,282 @@
 package com.lib.flutter_pcm_sound;
 
-import android.os.Build;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
-import android.media.AudioAttributes;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
-
 import androidx.annotation.NonNull;
-
-import java.util.Map;
 import java.util.HashMap;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.io.StringWriter;
-import java.io.PrintWriter;
-import java.nio.ByteBuffer;
-
+import java.util.Map;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.StandardMethodCodec;
 
-/**
- * FlutterPcmSoundPlugin implements a "one pedal" PCM sound playback mechanism.
- * Playback starts automatically when samples are fed and stops when no more samples are available.
- */
-public class FlutterPcmSoundPlugin implements
-    FlutterPlugin,
-    MethodChannel.MethodCallHandler
-{
-    private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
-    private static final int MAX_FRAMES_PER_BUFFER = 200;
-    private static final long DRAIN_POLL_MS = 10;
-    private static final int MAX_STALLED_POLLS = 10;
+public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.MethodCallHandler {
+    private final Object lifecycle = new Object();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private MethodChannel channel;
+    private Output output;
+    private long nextGeneration;
+    private long threshold = 8000;
+    private boolean attached;
 
-    private MethodChannel mMethodChannel;
-    private Handler mainThreadHandler = new Handler(Looper.getMainLooper());
-    private Thread playbackThread;
-    private volatile boolean mShouldCleanup = false;
-
-    private AudioTrack mAudioTrack;
-    private int mNumChannels;
-    private int mMinBufferSize;
-    private boolean mDidSetup = false;
-
-    private long mFeedThreshold = 8000;
-    private long mTotalFeeds = 0;
-    private long mLastLowBufferFeed = 0;
-    private long mLastZeroFeed = 0;
-
-    // Thread-safe queue for storing audio samples
-    private final LinkedBlockingQueue<ByteBuffer> mSamples = new LinkedBlockingQueue<>();
-
-    // Log level enum (kept for potential future use)
-    private enum LogLevel {
-        NONE,
-        ERROR,
-        STANDARD,
-        VERBOSE
+    @Override public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
+        synchronized (lifecycle) {
+            BinaryMessenger messenger = binding.getBinaryMessenger();
+            channel = new MethodChannel(messenger, "flutter_pcm_sound/methods", StandardMethodCodec.INSTANCE,
+                    messenger.makeBackgroundTaskQueue());
+            attached = true;
+            channel.setMethodCallHandler(this);
+        }
     }
 
-    private LogLevel mLogLevel = LogLevel.VERBOSE;
-
-    @Override
-    public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-        BinaryMessenger messenger = binding.getBinaryMessenger();
-        // Off the platform thread: a long UI frame must not stall feed().
-        mMethodChannel = new MethodChannel(
-            messenger, CHANNEL_NAME, StandardMethodCodec.INSTANCE, messenger.makeBackgroundTaskQueue());
-        mMethodChannel.setMethodCallHandler(this);
+    @Override public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        synchronized (lifecycle) {
+            attached = false;
+            channel.setMethodCallHandler(null);
+            // Runs on the main thread: a wedged worker must not crash engine teardown.
+            try { release(); } catch (IllegalStateException ignored) { }
+        }
     }
 
-    @Override
-    public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-        mMethodChannel.setMethodCallHandler(null);
-        cleanup();
+    private static long number(MethodCall call, String key, long fallback) {
+        Object value = call.argument(key);
+        return value instanceof Number ? ((Number) value).longValue() : fallback;
     }
 
-    @Override
-    @SuppressWarnings("deprecation") // Needed for compatibility with Android < 23
-    public void onMethodCall(@NonNull MethodCall call, @NonNull MethodChannel.Result result) {
-        try {
-            switch (call.method) {
-                case "setLogLevel": {
-                    result.success(true);
-                    break;
-                }
-                case "setup": {
-                    int sampleRate = call.argument("sample_rate");
-                    mNumChannels = call.argument("num_channels");
-
-                    // Cleanup existing resources if any
-                    if (mAudioTrack != null) {
-                        cleanup();
+    @Override public void onMethodCall(@NonNull MethodCall call, @NonNull MethodChannel.Result result) {
+        synchronized (lifecycle) {
+            try {
+                if (!attached) throw new IllegalStateException("Plugin detached");
+                switch (call.method) {
+                    case "setup":
+                    case "setupOutput": {
+                        int rate = (int) number(call, "sample_rate", 0);
+                        int channels = (int) number(call, "num_channels", 0);
+                        int capacity = (int) number(call, "capacity_frames", 48000);
+                        if (rate < 8000 || rate > 192000 || (channels != 1 && channels != 2)
+                                || capacity < 512 || capacity > 1920000)
+                            throw new IllegalArgumentException("Invalid PCM format or capacity");
+                        release();
+                        long generation = call.hasArgument("generation") ? number(call, "generation", 0) : ++nextGeneration;
+                        boolean legacy = call.method.equals("setup");
+                        // Published only once its worker runs, so feeds never queue into a dead output.
+                        Output created = new Output(rate, channels, capacity, generation, legacy);
+                        created.start();
+                        output = created;
+                        result.success(legacy ? created.nativeFrames : created.status());
+                        break;
                     }
-
-                    int channelConfig = (mNumChannels == 2) ?
-                        AudioFormat.CHANNEL_OUT_STEREO :
-                        AudioFormat.CHANNEL_OUT_MONO;
-
-                    mMinBufferSize = AudioTrack.getMinBufferSize(
-                        sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
-
-                    if (mMinBufferSize == AudioTrack.ERROR || mMinBufferSize == AudioTrack.ERROR_BAD_VALUE) {
-                        result.error("AudioTrackError", "Invalid buffer size.", null);
-                        return;
+                    case "feed": {
+                        Output current = requireOutput(call);
+                        byte[] data = call.argument("buffer");
+                        current.feed(data);
+                        result.success(Boolean.TRUE.equals(call.argument("status")) ? current.status() : true);
+                        break;
                     }
-
-                    if (Build.VERSION.SDK_INT >= 23) { // Android 6 (Marshmallow) and above
-                        mAudioTrack = new AudioTrack.Builder()
-                            .setAudioAttributes(new AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                    .build())
-                            .setAudioFormat(new AudioFormat.Builder()
-                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                    .setSampleRate(sampleRate)
-                                    .setChannelMask(channelConfig)
-                                    .build())
-                            .setBufferSizeInBytes(mMinBufferSize)
-                            .setTransferMode(AudioTrack.MODE_STREAM)
-                            .build();
-                    } else {
-                        mAudioTrack = new AudioTrack(
-                            AudioManager.STREAM_MUSIC,
-                            sampleRate,
-                            channelConfig,
-                            AudioFormat.ENCODING_PCM_16BIT,
-                            mMinBufferSize,
-                            AudioTrack.MODE_STREAM);
-                    }
-
-                    if (mAudioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
-                        result.error("AudioTrackError", "AudioTrack initialization failed.", null);
-                        mAudioTrack.release();
-                        mAudioTrack = null;
-                        return;
-                    }
-
-                    // Track capacity: the backlog the caller must fill before playback starts.
-                    int bufferFrames = (Build.VERSION.SDK_INT >= 23)
-                        ? mAudioTrack.getBufferSizeInFrames()
-                        : mMinBufferSize / (2 * mNumChannels);
-
-                    // reset: total_feeds counts from this setup
-                    mSamples.clear();
-                    mShouldCleanup = false;
-                    synchronized (mSamples) {
-                        mTotalFeeds = 0;
-                    }
-                    mLastLowBufferFeed = 0;
-                    mLastZeroFeed = 0;
-
-                    // start playback thread
-                    playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
-                    playbackThread.setPriority(Thread.MAX_PRIORITY);
-                    playbackThread.start();
-
-                    mDidSetup = true;
-
-                    result.success(bufferFrames);
-                    break;
-                }
-                case "feed": {
-
-                    // check setup (to match iOS behavior)
-                    if (mDidSetup == false) {
-                        result.error("Setup", "must call setup first", null);
-                        return;
-                    }
-
-                    byte[] buffer = call.argument("buffer");
-
-                    // Split for better performance
-                    List<ByteBuffer> chunks = split(buffer, MAX_FRAMES_PER_BUFFER);
-
-                    // Push samples
-                    synchronized (mSamples) {
-                        for (ByteBuffer chunk : chunks) {
-                            mSamples.add(chunk);
+                    case "status": result.success(requireOutput(call).status()); break;
+                    case "release":
+                        // Releasing an older generation is a harmless no-op, as on iOS.
+                        if (output != null && number(call, "generation", output.generation) != output.generation) {
+                            result.success(false); break;
                         }
-                        mTotalFeeds += 1;
-                    }
-
-                    result.success(true);
-                    break;
+                        release(); result.success(true); break;
+                    case "setFeedThreshold":
+                        threshold = Math.max(0, number(call, "feed_threshold", 8000));
+                        if (output != null) output.threshold = threshold;
+                        result.success(true); break;
+                    case "setLogLevel": result.success(true); break;
+                    default: result.notImplemented();
                 }
-                case "setFeedThreshold": {
-                    long feedThreshold = ((Number) call.argument("feed_threshold")).longValue();
-
-                    synchronized (mSamples) {
-                        mFeedThreshold = feedThreshold;
-                    }
-
-                    result.success(true);
-                    break;
-                }
-                case "release": {
-                    cleanup();
-                    result.success(true);
-                    break;
-                }
-                default:
-                    result.notImplemented();
-                    break;
+            } catch (CapacityException e) {
+                result.error("Capacity", e.getMessage(), null);
+            } catch (Exception e) {
+                result.error("PcmOutput", e.toString(), null);
             }
-
-
-        } catch (Exception e) {
-            StringWriter sw = new StringWriter();
-            PrintWriter pw = new PrintWriter(sw);
-            e.printStackTrace(pw);
-            String stackTrace = sw.toString();
-            result.error("androidException", e.toString(), stackTrace);
-            return;
         }
     }
 
-    /**
-     * Cleans up resources by stopping the playback thread and releasing AudioTrack.
-     */
-    private void cleanup() {
-        // stop playback thread
-        if (playbackThread != null) {
-            mShouldCleanup = true;
-            playbackThread.interrupt();
+    private Output requireOutput(MethodCall call) {
+        if (output == null) throw new IllegalStateException("Must call setup first");
+        if (number(call, "generation", output.generation) != output.generation)
+            throw new IllegalStateException("Stale output generation");
+        return output;
+    }
+
+    private void release() {
+        Output old = output;
+        if (old == null) return;
+        // Retain the failed generation if shutdown times out: never open a second track over it.
+        old.close();
+        output = null;
+    }
+
+    private static final class CapacityException extends IllegalStateException {
+        CapacityException() { super("PCM capacity exceeded"); }
+    }
+
+    private final class Output {
+        final Object lock = new Object();
+        final long generation;
+        final AudioTrack track;
+        final PcmQueue queue;
+        final int frameBytes;
+        final int nativeFrames;
+        final int capacityFrames;
+        final boolean legacy;
+        final Thread worker;
+        volatile boolean stopping;
+        volatile long threshold = FlutterPcmSoundPlugin.this.threshold;
+        long accepted;
+        long written;
+        long consumed;
+        final PcmHead head = new PcmHead(); // guarded by lock
+        long feeds;
+        long lastLow;
+        long lastZero;
+        String failure;
+        boolean running;
+        int underruns; // last count read while running: stays monotonic once the track is released
+
+        @SuppressWarnings("deprecation")
+        Output(int rate, int channels, int capacity, long generation, boolean legacy) {
+            this.generation = generation;
+            this.legacy = legacy;
+            frameBytes = channels * 2;
+            int mask = channels == 2 ? AudioFormat.CHANNEL_OUT_STEREO : AudioFormat.CHANNEL_OUT_MONO;
+            int minimum = AudioTrack.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT);
+            if (minimum <= 0) throw new IllegalArgumentException("Unsupported PCM format");
+            AudioTrack created = Build.VERSION.SDK_INT >= 23
+                ? new AudioTrack.Builder().setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                    .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(rate).setChannelMask(mask).build())
+                    .setBufferSizeInBytes(minimum).setTransferMode(AudioTrack.MODE_STREAM).build()
+                : new AudioTrack(AudioManager.STREAM_MUSIC, rate, mask,
+                    AudioFormat.ENCODING_PCM_16BIT, minimum, AudioTrack.MODE_STREAM);
+            if (created.getState() != AudioTrack.STATE_INITIALIZED) {
+                created.release();
+                throw new IllegalStateException("AudioTrack initialization failed");
+            }
             try {
-                playbackThread.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                nativeFrames = Build.VERSION.SDK_INT >= 23 ? created.getBufferSizeInFrames() : minimum / frameBytes;
+                capacityFrames = nativeFrames + capacity;
+                queue = new PcmQueue(capacityFrames, frameBytes);
+                worker = new Thread(this::run, "PCMPlaybackThread");
+                track = created;
+            } catch (RuntimeException | Error error) {
+                created.release();
+                throw error;
             }
-            playbackThread = null;
-            mDidSetup = false;
         }
-    }
 
-    /**
-     * Invokes the 'OnFeedSamples' callback with the number of remaining frames,
-     * and the number of feeds (since setup) that count includes.
-     */
-    private void invokeFeedCallback(long remainingFrames, long totalFeeds) {
-        Map<String, Object> response = new HashMap<>();
-        response.put("remaining_frames", remainingFrames);
-        response.put("total_feeds", totalFeeds);
-        mMethodChannel.invokeMethod("OnFeedSamples", response);
-    }
+        void start() {
+            try { worker.start(); }
+            catch (RuntimeException | Error error) { track.release(); throw error; }
+        }
 
-    /**
-     * The main loop of the playback thread.
-     */
-    private void playbackThreadLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
-
-        mAudioTrack.play();
-
-        long framesWritten = 0;
-        // True once the zero event fired for the current feed: nothing left to report.
-        boolean drained = true;
-        long lastHead = -1;
-        int stalledPolls = 0;
-
-        while (!mShouldCleanup) {
-            ByteBuffer data = null;
-            try {
-                // Poll while the track still drains, so its zero event is reported.
-                data = drained ? mSamples.take() : mSamples.poll(DRAIN_POLL_MS, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                continue;
+        void feed(byte[] bytes) {
+            synchronized (lock) {
+                if (stopping || failure != null) throw new IllegalStateException(failure == null ? "Output stopped" : failure);
+                if (bytes == null || bytes.length % frameBytes != 0)
+                    throw new IllegalArgumentException("PCM data is not frame aligned");
+                int frames = bytes.length / frameBytes;
+                if (accepted - consumed + frames > capacityFrames || !queue.offer(bytes)) throw new CapacityException();
+                accepted += frames;
+                feeds++;
+                lock.notifyAll();
             }
+        }
 
-            if (data != null) {
-                drained = false;
-                int written = mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
-                if (written > 0) {framesWritten += written / (2 * mNumChannels);}
+        Map<String, Object> status() {
+            synchronized (lock) {
+                // Receipts stay current while the worker blocks in write(); a stopping track's head reads 0.
+                if (running && !stopping) updateConsumed();
+                Map<String, Object> result = new HashMap<>();
+                result.put("generation", generation);
+                result.put("accepted_frames", accepted);
+                result.put("consumed_frames", consumed);
+                result.put("remaining_frames", accepted - consumed);
+                result.put("capacity_frames", capacityFrames);
+                result.put("native_buffer_frames", nativeFrames);
+                result.put("total_feeds", feeds);
+                if (Build.VERSION.SDK_INT >= 24 && running) underruns = track.getUnderrunCount();
+                result.put("underruns", underruns);
+                result.put("failure", failure);
+                return result;
             }
+        }
 
-            // Frames the mixer has not consumed yet; modular, so the 32-bit head may wrap.
-            long head = mAudioTrack.getPlaybackHeadPosition();
-            long inTrack = (framesWritten - head) & 0xFFFFFFFFL;
+        void close() {
+            stopping = true;
+            synchronized (lock) { lock.notifyAll(); }
+            PcmWorkerShutdown.await(worker, () -> {
+                try { track.pause(); track.flush(); } catch (IllegalStateException ignored) { }
+            }, 1000);
+        }
 
-            // A part-filled track never starts, so it never drains: stop polling it.
-            stalledPolls = (data == null && head == lastHead) ? stalledPolls + 1 : 0;
-            lastHead = head;
-            if (stalledPolls >= MAX_STALLED_POLLS) {drained = true;}
-
-            long remainingFrames;
-            long totalFeeds;
-            long feedThreshold;
-
-            // grab shared data
-            synchronized (mSamples) {
-                long totalBytes = 0;
-                for (ByteBuffer sampleBuffer : mSamples) {
-                    totalBytes += sampleBuffer.remaining();
+        private void notifyLegacy() {
+            if (!legacy) return;
+            Map<String, Object> reading;
+            synchronized (lock) {
+                long remaining = accepted - consumed;
+                boolean low = remaining <= threshold && lastLow != feeds;
+                boolean zero = remaining == 0 && lastZero != feeds;
+                if (!low && !zero) return;
+                if (low) lastLow = feeds;
+                if (zero) lastZero = feeds;
+                reading = status();
+            }
+            main.post(() -> {
+                synchronized (lifecycle) {
+                    if (attached && output == this && !stopping) channel.invokeMethod("OnFeedSamples", reading);
                 }
-                remainingFrames = totalBytes / (2 * mNumChannels) + inTrack;
-                totalFeeds = mTotalFeeds;
-                feedThreshold = mFeedThreshold;
-            }
-
-            // check for events
-            boolean isLowBufferEvent = (remainingFrames <= feedThreshold) && (mLastLowBufferFeed != totalFeeds);
-            boolean isZeroCrossingEvent = (remainingFrames == 0) && (mLastZeroFeed != totalFeeds);
-
-            // send events
-            if (isLowBufferEvent || isZeroCrossingEvent) {
-                if (isLowBufferEvent) {mLastLowBufferFeed = totalFeeds;}
-                if (isZeroCrossingEvent) {mLastZeroFeed = totalFeeds; drained = true;}
-                mainThreadHandler.post(() -> invokeFeedCallback(remainingFrames, totalFeeds));
-            }
+            });
         }
 
-        mAudioTrack.stop();
-        mAudioTrack.flush();
-        mAudioTrack.release();
-        mAudioTrack = null;
-    }
-
-
-    private List<ByteBuffer> split(byte[] buffer, int maxSize) {
-        List<ByteBuffer> chunks = new ArrayList<>();
-        int offset = 0;
-        while (offset < buffer.length) {
-            int length = Math.min(buffer.length - offset, maxSize);
-            ByteBuffer b = ByteBuffer.wrap(buffer, offset, length);
-            chunks.add(b);
-            offset += length;
+        private void updateConsumed() {
+            synchronized (lock) { consumed = head.consumed(track.getPlaybackHeadPosition(), written); }
         }
-        return chunks;
+
+        private void run() {
+            try {
+                PcmWritePump pump = new PcmWritePump(512, frameBytes);
+                // Blocks until the device takes the chunk (every API level); close()'s pause() cuts it short.
+                PcmWritePump.Sink sink = (bytes, offset, length) -> track.write(bytes, offset, length);
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+                track.play();
+                synchronized (lock) { running = true; }
+                while (!stopping) {
+                    if (!pump.hasPending()) {
+                        synchronized (lock) { pump.refill(queue); }
+                    }
+                    if (pump.hasPending()) {
+                        int count = pump.write(sink);
+                        synchronized (lock) { written += count / frameBytes; }
+                        // Only an interrupted write (close) comes back empty: back off rather than spin.
+                        if (count == 0) Thread.sleep(2);
+                    } else {
+                        synchronized (lock) {
+                            if (!stopping && queue.frames() == 0) lock.wait(accepted == consumed ? 0 : 10);
+                        }
+                    }
+                    if (!stopping) { updateConsumed(); notifyLegacy(); }
+                }
+            } catch (InterruptedException e) {
+                if (!stopping) synchronized (lock) { failure = "PCM worker interrupted"; }
+            } catch (Throwable e) {
+                synchronized (lock) { failure = e.toString(); }
+            } finally {
+                synchronized (lock) { running = false; }
+                try { track.stop(); } catch (IllegalStateException ignored) { }
+                try { track.flush(); } catch (IllegalStateException ignored) { }
+                track.release();
+            }
+        }
     }
 }
