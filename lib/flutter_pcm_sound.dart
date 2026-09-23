@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'dart:async';
+import 'dart:developer' show Timeline;
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
 
@@ -24,6 +25,9 @@ class PcmOutputStatus {
   /// Starvation episodes since setup, counted as Android's getUnderrunCount counts them.
   final int underruns;
   final String? failure;
+  final int? sampleRate;
+  final String? outputRoute;
+  final PcmPresentationTimestamp? presentation;
 
   const PcmOutputStatus({
     required this.generation,
@@ -34,20 +38,53 @@ class PcmOutputStatus {
     required this.totalFeeds,
     required this.underruns,
     this.failure,
+    this.sampleRate,
+    this.outputRoute,
+    this.presentation,
   });
 
-  factory PcmOutputStatus.fromMap(Map<dynamic, dynamic> map) => PcmOutputStatus(
-    generation: map['generation'] as int,
-    acceptedFrames: map['accepted_frames'] as int,
-    consumedFrames: map['consumed_frames'] as int,
-    capacityFrames: map['capacity_frames'] as int,
-    nativeBufferFrames: map['native_buffer_frames'] as int,
-    totalFeeds: map['total_feeds'] as int,
-    underruns: map['underruns'] as int,
-    failure: map['failure'] as String?,
-  );
+  factory PcmOutputStatus.fromMap(Map<dynamic, dynamic> map,
+          {int? clockOffsetNs}) =>
+      PcmOutputStatus(
+        generation: map['generation'] as int,
+        acceptedFrames: map['accepted_frames'] as int,
+        consumedFrames: map['consumed_frames'] as int,
+        capacityFrames: map['capacity_frames'] as int,
+        nativeBufferFrames: map['native_buffer_frames'] as int,
+        totalFeeds: map['total_feeds'] as int,
+        underruns: map['underruns'] as int,
+        failure: map['failure'] as String?,
+        sampleRate: map['sample_rate'] as int?,
+        outputRoute: map['output_route'] as String?,
+        presentation: PcmPresentationTimestamp.fromMap(map,
+            clockOffsetNs: clockOffsetNs),
+      );
 
   int get remainingFrames => acceptedFrames - consumedFrames;
+}
+
+/// Native monotonic time for an output frame, not the time its receipt arrived.
+class PcmPresentationTimestamp {
+  const PcmPresentationTimestamp({
+    required this.frame,
+    required this.nativeTimeNs,
+    this.hostTimeUs,
+  });
+  final int frame;
+  final int nativeTimeNs;
+  final int? hostTimeUs;
+
+  static PcmPresentationTimestamp? fromMap(Map<dynamic, dynamic> map,
+      {int? clockOffsetNs}) {
+    final frame = map['timestamp_frame'] as int?;
+    final time = map['timestamp_ns'] as int?;
+    if (frame == null || time == null || frame < 0 || time <= 0) return null;
+    return PcmPresentationTimestamp(
+      frame: frame,
+      nativeTimeNs: time,
+      hostTimeUs: clockOffsetNs == null ? null : (time + clockOffsetNs) ~/ 1000,
+    );
+  }
 }
 
 class FlutterPcmSound {
@@ -62,6 +99,39 @@ class FlutterPcmSound {
   static LogLevel _logLevel = LogLevel.standard;
 
   static bool _needsStart = true;
+  static var _setupRevision = 0;
+  static int? _requestedGeneration;
+  static int? _clockGeneration;
+  static int? _clockOffsetNs;
+
+  static Future<int> _synchronizeClock() async {
+    int? offset;
+    var bestRoundTripNs = 0;
+    for (var sample = 0; sample < 5; sample++) {
+      final beforeNs = Timeline.now * 1000;
+      final nativeNs = await _nativeClockNs();
+      final afterNs = Timeline.now * 1000;
+      // The shortest round trip gives the tightest offset.
+      if (offset == null || afterNs - beforeNs < bestRoundTripNs) {
+        bestRoundTripNs = afterNs - beforeNs;
+        offset = (beforeNs + afterNs) ~/ 2 - nativeNs;
+      }
+    }
+    return offset!;
+  }
+
+  static PcmOutputStatus _decodeStatus(Map<dynamic, dynamic> map) {
+    // Only the current generation's exchange maps its timestamps.
+    final mapped = map['generation'] == _clockGeneration;
+    return PcmOutputStatus.fromMap(
+      map,
+      clockOffsetNs: mapped ? _clockOffsetNs : null,
+    );
+  }
+
+  /// Exchanges the same monotonic clock used by output timestamps.
+  static Future<int> _nativeClockNs() async =>
+      (await _invokeMethod<int>('clock'))!;
 
   /// set log level
   static Future<void> setLogLevel(LogLevel level) async {
@@ -81,6 +151,9 @@ class FlutterPcmSound {
     IosAudioCategory? iosAudioCategory = IosAudioCategory.playback,
     bool iosAllowBackgroundAudio = false,
   }) async {
+    ++_setupRevision;
+    _requestedGeneration = null;
+    _clockGeneration = null;
     final reply = await _invokeMethod<Object>('setup', {
       'sample_rate': sampleRate,
       'num_channels': channelCount,
@@ -107,6 +180,12 @@ class FlutterPcmSound {
         capacityFrames > 1920000) {
       throw ArgumentError('Invalid PCM format or capacity');
     }
+    final revision = ++_setupRevision;
+    _requestedGeneration = generation;
+    final offsetNs = await _synchronizeClock();
+    if (revision != _setupRevision) throw StateError('PCM setup cancelled');
+    _clockOffsetNs = offsetNs;
+    _clockGeneration = generation;
     final reply = await _invokeMethod<Map<dynamic, dynamic>>('setupOutput', {
       'sample_rate': sampleRate,
       'num_channels': channelCount,
@@ -115,7 +194,11 @@ class FlutterPcmSound {
       'ios_audio_category': iosAudioCategory?.name,
       'ios_allow_background_audio': iosAllowBackgroundAudio,
     });
-    return PcmOutputStatus.fromMap(reply!);
+    if (revision != _setupRevision) {
+      await _invokeMethod<void>('release', {'generation': generation});
+      throw StateError('PCM setup cancelled');
+    }
+    return _decodeStatus(reply!);
   }
 
   static Future<PcmOutputStatus> feedWithStatus(
@@ -130,11 +213,11 @@ class FlutterPcmSound {
       'generation': generation,
       'status': true,
     });
-    return PcmOutputStatus.fromMap(reply!);
+    return _decodeStatus(reply!);
   }
 
   static Future<PcmOutputStatus> status({required int generation}) async =>
-      PcmOutputStatus.fromMap(
+      _decodeStatus(
         (await _invokeMethod<Map<dynamic, dynamic>>('status', {
           'generation': generation,
         }))!,
@@ -194,6 +277,11 @@ class FlutterPcmSound {
 
   /// release all audio resources
   static Future<void> release({int? generation}) async {
+    if (generation == null || generation == _requestedGeneration) {
+      ++_setupRevision;
+      _requestedGeneration = null;
+      _clockGeneration = null;
+    }
     await _invokeMethod('release', {
       if (generation != null) 'generation': generation,
     });

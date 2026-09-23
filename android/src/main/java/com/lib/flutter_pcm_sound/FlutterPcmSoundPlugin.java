@@ -2,14 +2,16 @@ package com.lib.flutter_pcm_sound;
 
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
-import android.media.AudioManager;
+import android.media.AudioRouting;
 import android.media.AudioTrack;
-import android.os.Build;
+import android.media.AudioTimestamp;
+import android.media.AudioDeviceInfo;
 import android.os.Handler;
 import android.os.Looper;
 import androidx.annotation.NonNull;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
@@ -80,6 +82,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                         break;
                     }
                     case "status": result.success(requireOutput(call).status()); break;
+                    case "clock": result.success(System.nanoTime()); break;
                     case "release":
                         // Releasing an older generation is a harmless no-op, as on iOS.
                         if (output != null && number(call, "generation", output.generation) != output.generation) {
@@ -121,11 +124,25 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
     }
 
     private final class Output {
+        // Poll fast until timestamps advance, then rarely: the anchor only drifts slowly.
+        private static final long FAST_POLL_NS = 100_000_000L, STABLE_POLL_NS = 10_000_000_000L;
+        private static final int STABLE_READINGS = 2;
         final Object lock = new Object();
         final long generation;
         final AudioTrack track;
         final PcmQueue queue;
         final int frameBytes;
+        final int sampleRate;
+        final AudioTimestamp timestamp = new AudioTimestamp();
+        long timestampFrame = -1;
+        long timestampNs;
+        long timestampPollNs;
+        int stableTimestamps;
+        int timingUnderruns;
+        String routeId;
+        volatile boolean routeDirty = true; // set by the routing listener: status re-reads the route once
+        // AudioRouting's type, so registration skips the deprecated AudioTrack overload.
+        final AudioRouting.OnRoutingChangedListener routing = router -> routeDirty = true;
         final int nativeFrames;
         final int capacityFrames;
         final boolean legacy;
@@ -143,28 +160,25 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         boolean running;
         int underruns; // last count read while running: stays monotonic once the track is released
 
-        @SuppressWarnings("deprecation")
         Output(int rate, int channels, int capacity, long generation, boolean legacy) {
             this.generation = generation;
+            this.sampleRate = rate;
             this.legacy = legacy;
             frameBytes = channels * 2;
             int mask = channels == 2 ? AudioFormat.CHANNEL_OUT_STEREO : AudioFormat.CHANNEL_OUT_MONO;
             int minimum = AudioTrack.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT);
             if (minimum <= 0) throw new IllegalArgumentException("Unsupported PCM format");
-            AudioTrack created = Build.VERSION.SDK_INT >= 23
-                ? new AudioTrack.Builder().setAudioAttributes(new AudioAttributes.Builder()
+            AudioTrack created = new AudioTrack.Builder().setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                    .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(rate).setChannelMask(mask).build())
-                    .setBufferSizeInBytes(minimum).setTransferMode(AudioTrack.MODE_STREAM).build()
-                : new AudioTrack(AudioManager.STREAM_MUSIC, rate, mask,
-                    AudioFormat.ENCODING_PCM_16BIT, minimum, AudioTrack.MODE_STREAM);
+                .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate).setChannelMask(mask).build())
+                .setBufferSizeInBytes(minimum).setTransferMode(AudioTrack.MODE_STREAM).build();
             if (created.getState() != AudioTrack.STATE_INITIALIZED) {
                 created.release();
                 throw new IllegalStateException("AudioTrack initialization failed");
             }
             try {
-                nativeFrames = Build.VERSION.SDK_INT >= 23 ? created.getBufferSizeInFrames() : minimum / frameBytes;
+                nativeFrames = created.getBufferSizeInFrames();
                 capacityFrames = nativeFrames + capacity;
                 queue = new PcmQueue(capacityFrames, frameBytes);
                 worker = new Thread(this::run, "PCMPlaybackThread");
@@ -205,11 +219,44 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 result.put("capacity_frames", capacityFrames);
                 result.put("native_buffer_frames", nativeFrames);
                 result.put("total_feeds", feeds);
-                if (Build.VERSION.SDK_INT >= 24 && running) underruns = track.getUnderrunCount();
+                if (running) underruns = track.getUnderrunCount();
                 result.put("underruns", underruns);
                 result.put("failure", failure);
+                updateTimestamp();
+                result.put("sample_rate", sampleRate);
+                result.put("output_route", routeId);
+                result.put("timestamp_frame", timestampFrame < 0 ? null : timestampFrame);
+                result.put("timestamp_ns", timestampFrame < 0 ? null : timestampNs);
                 return result;
             }
+        }
+
+        private void updateTimestamp() {
+            if (!running || stopping || failure != null) { timestampFrame = -1; return; }
+            String currentRoute = routeId;
+            // Re-read only after a routing change, or while unrouted: registration follows play().
+            if (routeDirty || currentRoute == null) {
+                routeDirty = false;
+                AudioDeviceInfo route = track.getRoutedDevice();
+                currentRoute = route == null ? null : route.getType() + ":" + route.getId();
+            }
+            if (!Objects.equals(routeId, currentRoute) || underruns != timingUnderruns) {
+                routeId = currentRoute;
+                timingUnderruns = underruns;
+                timestampFrame = -1;
+                stableTimestamps = 0;
+                timestampPollNs = 0;
+            }
+            long now = System.nanoTime();
+            long interval = stableTimestamps >= STABLE_READINGS ? STABLE_POLL_NS : FAST_POLL_NS;
+            if (now - timestampPollNs < interval) return;
+            timestampPollNs = now;
+            if (!track.getTimestamp(timestamp)) { timestampFrame = -1; stableTimestamps = 0; return; }
+            long frame = PcmTimestamp.extend(timestamp.framePosition, written);
+            if (frame < 0 || timestamp.nanoTime <= 0) return;
+            if (frame > timestampFrame && timestamp.nanoTime > timestampNs) stableTimestamps++;
+            timestampFrame = frame;
+            timestampNs = timestamp.nanoTime;
         }
 
         void close() {
@@ -246,10 +293,11 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         private void run() {
             try {
                 PcmWritePump pump = new PcmWritePump(512, frameBytes);
-                // Blocks until the device takes the chunk (every API level); close()'s pause() cuts it short.
+                // Blocks until the device takes the chunk; close()'s pause() cuts it short.
                 PcmWritePump.Sink sink = (bytes, offset, length) -> track.write(bytes, offset, length);
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
                 track.play();
+                track.addOnRoutingChangedListener(routing, main);
                 synchronized (lock) { running = true; }
                 while (!stopping) {
                     if (!pump.hasPending()) {
@@ -275,6 +323,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 synchronized (lock) { running = false; }
                 try { track.stop(); } catch (IllegalStateException ignored) { }
                 try { track.flush(); } catch (IllegalStateException ignored) { }
+                track.removeOnRoutingChangedListener(routing);
                 track.release();
             }
         }

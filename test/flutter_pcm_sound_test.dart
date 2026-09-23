@@ -1,4 +1,6 @@
 import 'dart:typed_data';
+import 'dart:async';
+import 'dart:developer' show Timeline;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
@@ -16,12 +18,15 @@ void main() {
     'total_feeds': 1,
     'underruns': 0,
     'failure': null,
+    'sample_rate': 48000,
+    'output_route': 'speaker:1',
   };
   setUp(() {
     calls.clear();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
           calls.add(call);
+          if (call.method == 'clock') return Timeline.now * 1000 + 9000000000;
           if (call.method == 'setupOutput' ||
               call.method == 'status' ||
               call.method == 'feed' && call.arguments['status'] == true)
@@ -89,5 +94,84 @@ void main() {
       ),
       throwsA(isA<PlatformException>()),
     );
+  });
+  test('native frame times are mapped independently of receipt arrival',
+      () async {
+    status['timestamp_frame'] = 64;
+    status['timestamp_ns'] = Timeline.now * 1000 + 9000000000;
+    addTearDown(() => status
+      ..remove('timestamp_frame')
+      ..remove('timestamp_ns'));
+    final before = Timeline.now;
+    final output = await FlutterPcmSound.setupOutput(
+      sampleRate: 48000,
+      channelCount: 1,
+      generation: 42,
+    );
+    expect(output.presentation!.frame, 64);
+    expect(output.presentation!.hostTimeUs!, closeTo(before, 20000));
+    final original = output.presentation!.hostTimeUs;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(
+        (await FlutterPcmSound.status(generation: 42)).presentation!.hostTimeUs,
+        original);
+  });
+  test('another generation\'s timestamps stay unmapped', () async {
+    await FlutterPcmSound.setupOutput(
+        sampleRate: 48000, channelCount: 1, generation: 42);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async => {
+              ...status,
+              'generation': 43,
+              'timestamp_frame': 64,
+              'timestamp_ns': Timeline.now * 1000 + 9000000000,
+            });
+    final presentation =
+        (await FlutterPcmSound.status(generation: 43)).presentation!;
+    expect(presentation.frame, 64);
+    expect(presentation.hostTimeUs, isNull);
+  });
+  test('unavailable native timestamps remain unavailable', () {
+    expect(PcmOutputStatus.fromMap(status).presentation, isNull);
+  });
+
+  test('release during clock synchronization cannot create a late output',
+      () async {
+    final clock = Completer<int>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'clock') return clock.future;
+      return null;
+    });
+    final pending = FlutterPcmSound.setupOutput(
+        sampleRate: 48000, channelCount: 1, generation: 88);
+    final expected = expectLater(pending, throwsStateError);
+    await FlutterPcmSound.release(generation: 88);
+    clock.complete(Timeline.now * 1000);
+    await expected;
+    expect(calls.where((call) => call.method == 'setupOutput'), isEmpty);
+  });
+  test('release during native setup releases the late output', () async {
+    final setup = Completer<Map<String, Object?>>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'clock') return Timeline.now * 1000;
+      if (call.method == 'setupOutput') return setup.future;
+      return null;
+    });
+    final pending = FlutterPcmSound.setupOutput(
+        sampleRate: 48000, channelCount: 1, generation: 90);
+    final expected = expectLater(pending, throwsStateError);
+    await pumpEventQueue();
+    expect(calls.last.method, 'setupOutput');
+    await FlutterPcmSound.release(generation: 90);
+    setup.complete({...status, 'generation': 90});
+    await expected;
+    final releases = calls.where((call) => call.method == 'release').toList();
+    expect(releases, hasLength(2));
+    expect(calls.last.method, 'release');
+    expect(calls.last.arguments['generation'], 90);
   });
 }
