@@ -18,9 +18,15 @@ separate from timestamp validity.
 - Five clock exchanges map native monotonic time to `Timeline.now`; the shortest
   round trip sets the offset. Neither platform reports a bound on driver,
   converter or acoustic latency, so none is exposed.
-- Setup is cancellable during clock synchronization. A release cannot be followed
-  by a late setup creating an orphan output. Generation-specific cleanup does not
-  release a newer output.
+- Setup is cancellable during its claim and clock synchronization. A release
+  cannot be followed by a late setup creating an orphan output.
+  Generation-specific cleanup does not release a newer output.
+- `setupOutput` claims first and sends the claim as its `owner`. Native refuses
+  an owned setup once a newer claim exists (`Superseded`), with no side effects,
+  so the setup begun last wins across isolates. Legacy `setup` claims afresh.
+  Callers must reach `setupOutput` in the same event turn as their last stop
+  check: a native round trip in between lets a stopped caller claim after its
+  successor. `setLogLevel` makes none.
 
 The iOS callback timestamp is a scheduling anchor. Physical loopback must establish
 its residual relation to capture on each route before using it for grading.

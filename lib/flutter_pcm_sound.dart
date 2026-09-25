@@ -133,10 +133,13 @@ class FlutterPcmSound {
   static Future<int> _nativeClockNs() async =>
       (await _invokeMethod<int>('clock'))!;
 
-  /// set log level
+  /// Takes the newest native claim: an owned setup is refused once a newer one exists.
+  static Future<int> _claim() async => (await _invokeMethod<int>('claim'))!;
+
+  /// Sets the Dart-side log level. No native round trip, so awaiting it just
+  /// before [setupOutput] lets no stop in between a caller's check and its claim.
   static Future<void> setLogLevel(LogLevel level) async {
     _logLevel = level;
-    return await _invokeMethod('setLogLevel', {'log_level': level.index});
   }
 
   /// setup audio
@@ -182,6 +185,9 @@ class FlutterPcmSound {
     }
     final revision = ++_setupRevision;
     _requestedGeneration = generation;
+    // Claimed before the clock sync, so the setup begun last wins across isolates.
+    final owner = await _claim();
+    if (revision != _setupRevision) throw StateError('PCM setup cancelled');
     final offsetNs = await _synchronizeClock();
     if (revision != _setupRevision) throw StateError('PCM setup cancelled');
     _clockOffsetNs = offsetNs;
@@ -193,6 +199,7 @@ class FlutterPcmSound {
       'capacity_frames': capacityFrames,
       'ios_audio_category': iosAudioCategory?.name,
       'ios_allow_background_audio': iosAllowBackgroundAudio,
+      'owner': owner,
     });
     if (revision != _setupRevision) {
       await _invokeMethod<void>('release', {'generation': generation});

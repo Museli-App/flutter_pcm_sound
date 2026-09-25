@@ -15,11 +15,13 @@ javac -d /tmp/pcm-tests \
   android/src/main/java/com/lib/flutter_pcm_sound/PcmQueue.java \
   android/src/main/java/com/lib/flutter_pcm_sound/PcmWritePump.java \
   android/src/main/java/com/lib/flutter_pcm_sound/PcmWorkerShutdown.java \
+  android/src/main/java/com/lib/flutter_pcm_sound/PcmClaims.java \
   test/native/com/lib/flutter_pcm_sound/*.java
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmTimestampTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmHeadTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmQueueTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmWritePumpTest
+java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmClaimsTest
 flutter test
 ```
 
@@ -27,7 +29,8 @@ The C test checks capacity rejection, wraparound, empty reads, a million
 concurrent producer/consumer transfers, the idle-stop grace and one underrun per
 starvation episode. JVM tests check the widened, capped playback head, frame
 alignment, bounded storage, short/zero writes, dead-track/error returns,
-preserved tails, cleanup through exceptions and bounded shutdown. Method-channel tests cover generation
+preserved tails, cleanup through exceptions and bounded shutdown. JVM and C claim tests check that
+only the newest owned setup is admitted and an unowned one claims afresh. Method-channel tests cover generation
 receipts, byte-view offsets/lengths, validation and rejected feeds.
 
 These are host regressions, not measurements of AudioTrack/AudioUnit behavior on
@@ -49,4 +52,12 @@ Output timestamp snapshot regression (one million concurrent publications):
 clang -std=c11 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined \
   test/native/pcm_timing_test.c -o /tmp/pcm-timing-test
 /tmp/pcm-timing-test
+```
+
+Takeover claim regression (the same rule as `PcmClaims.java`):
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  test/native/pcm_claims_test.c -o /tmp/pcm-claims-test
+/tmp/pcm-claims-test
 ```

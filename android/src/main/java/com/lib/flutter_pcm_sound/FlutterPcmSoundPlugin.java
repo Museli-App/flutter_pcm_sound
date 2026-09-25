@@ -24,6 +24,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
     private MethodChannel channel;
     private Output output;
     private long nextGeneration;
+    private final PcmClaims claims = new PcmClaims();
     private long threshold = 8000;
     private boolean attached;
 
@@ -64,6 +65,9 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                         if (rate < 8000 || rate > 192000 || (channels != 1 && channels != 2)
                                 || capacity < 512 || capacity > 1920000)
                             throw new IllegalArgumentException("Invalid PCM format or capacity");
+                        // A setup begun before a newer claim must not replace that owner.
+                        if (!claims.admit(call.hasArgument("owner") ? number(call, "owner", 0) : null))
+                            throw new SupersededException();
                         release();
                         long generation = call.hasArgument("generation") ? number(call, "generation", 0) : ++nextGeneration;
                         boolean legacy = call.method.equals("setup");
@@ -83,6 +87,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                     }
                     case "status": result.success(requireOutput(call).status()); break;
                     case "clock": result.success(System.nanoTime()); break;
+                    case "claim": result.success(claims.take()); break;
                     case "release":
                         // Releasing an older generation is a harmless no-op, as on iOS.
                         if (output != null && number(call, "generation", output.generation) != output.generation) {
@@ -93,11 +98,12 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                         threshold = Math.max(0, number(call, "feed_threshold", 8000));
                         if (output != null) output.threshold = threshold;
                         result.success(true); break;
-                    case "setLogLevel": result.success(true); break;
                     default: result.notImplemented();
                 }
             } catch (CapacityException e) {
                 result.error("Capacity", e.getMessage(), null);
+            } catch (SupersededException e) {
+                result.error("Superseded", e.getMessage(), null);
             } catch (Exception e) {
                 result.error("PcmOutput", e.toString(), null);
             }
@@ -121,6 +127,10 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
 
     private static final class CapacityException extends IllegalStateException {
         CapacityException() { super("PCM capacity exceeded"); }
+    }
+
+    private static final class SupersededException extends IllegalStateException {
+        SupersededException() { super("A newer setup claimed the output"); }
     }
 
     private final class Output {

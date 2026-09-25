@@ -26,6 +26,7 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
           calls.add(call);
+          if (call.method == 'claim') return 7;
           if (call.method == 'clock') return Timeline.now * 1000 + 9000000000;
           if (call.method == 'setupOutput' ||
               call.method == 'status' ||
@@ -141,12 +142,15 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
+      if (call.method == 'claim') return 7;
       if (call.method == 'clock') return clock.future;
       return null;
     });
     final pending = FlutterPcmSound.setupOutput(
         sampleRate: 48000, channelCount: 1, generation: 88);
     final expected = expectLater(pending, throwsStateError);
+    await pumpEventQueue();
+    expect(calls.last.method, 'clock');
     await FlutterPcmSound.release(generation: 88);
     clock.complete(Timeline.now * 1000);
     await expected;
@@ -157,6 +161,7 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
+      if (call.method == 'claim') return 7;
       if (call.method == 'clock') return Timeline.now * 1000;
       if (call.method == 'setupOutput') return setup.future;
       return null;
@@ -173,5 +178,63 @@ void main() {
     expect(releases, hasLength(2));
     expect(calls.last.method, 'release');
     expect(calls.last.arguments['generation'], 90);
+  });
+  test('setupOutput claims first and owns its setup; legacy setup is unowned',
+      () async {
+    await FlutterPcmSound.setupOutput(
+        sampleRate: 48000, channelCount: 1, generation: 42);
+    expect(calls.first.method, 'claim');
+    expect(calls.last.method, 'setupOutput');
+    expect(calls.last.arguments['owner'], 7);
+    calls.clear();
+    await FlutterPcmSound.setup(sampleRate: 48000, channelCount: 1);
+    expect(calls.map((call) => call.method), ['setup']);
+    expect(calls.single.arguments.containsKey('owner'), isFalse);
+  });
+  test('setLogLevel stays in Dart, so a setup awaited after it claims first',
+      () async {
+    addTearDown(() => FlutterPcmSound.setLogLevel(LogLevel.standard));
+    await FlutterPcmSound.setLogLevel(LogLevel.error);
+    expect(calls, isEmpty);
+    await FlutterPcmSound.setupOutput(
+        sampleRate: 48000, channelCount: 1, generation: 42);
+    expect(calls.first.method, 'claim');
+  });
+  test('a superseded setup surfaces as an error and releases nothing',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'claim') return 7;
+      if (call.method == 'clock') return Timeline.now * 1000;
+      if (call.method == 'setupOutput') {
+        throw PlatformException(code: 'Superseded');
+      }
+      return null;
+    });
+    await expectLater(
+      FlutterPcmSound.setupOutput(
+          sampleRate: 48000, channelCount: 1, generation: 91),
+      throwsA(isA<PlatformException>()
+          .having((error) => error.code, 'code', 'Superseded')),
+    );
+    expect(calls.last.method, 'setupOutput');
+    expect(calls.where((call) => call.method == 'release'), isEmpty);
+  });
+  test('release during the claim cancels before the clock sync', () async {
+    final claim = Completer<int>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'claim') return claim.future;
+      return null;
+    });
+    final pending = FlutterPcmSound.setupOutput(
+        sampleRate: 48000, channelCount: 1, generation: 89);
+    final expected = expectLater(pending, throwsStateError);
+    await FlutterPcmSound.release(generation: 89);
+    claim.complete(7);
+    await expected;
+    expect(calls.map((call) => call.method), ['claim', 'release']);
   });
 }

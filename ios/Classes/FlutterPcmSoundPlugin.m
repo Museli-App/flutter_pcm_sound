@@ -1,4 +1,5 @@
 #import "FlutterPcmSoundPlugin.h"
+#import "PcmClaims.h"
 #import "PcmRing.h"
 #import "PcmTiming.h"
 #import <mach/mach_time.h>
@@ -23,6 +24,7 @@ static OSStatus RenderCallback(void *, AudioUnitRenderActionFlags *, const Audio
     _Atomic(bool) _starved;
     _Atomic(bool) _routeDirty; // set on a route change or reactivation: status re-reads the route once
     PcmIdle _idle; // only under @synchronized(self)
+    PcmClaims _claims; // only under @synchronized(self)
 }
 @property(nonatomic) FlutterMethodChannel *channel;
 @property(nonatomic) AudioComponentInstance unit;
@@ -147,6 +149,9 @@ static OSStatus RenderCallback(void *, AudioUnitRenderActionFlags *, const Audio
     NSInteger capacity = args[@"capacity_frames"] ? [args[@"capacity_frames"] integerValue] : DefaultCapacity;
     if (rate < 8000 || rate > 192000 || (channels != 1 && channels != 2) || capacity < 512 || capacity > 1920000)
         return [self error:@"Arguments" message:@"Invalid PCM format or capacity"];
+    // A setup begun before a newer claim must not replace that owner.
+    if (!PcmClaimsAdmit(&_claims, args[@"owner"] != nil, [args[@"owner"] unsignedLongLongValue]))
+        return [self error:@"Superseded" message:@"A newer setup claimed the output"];
     [self cleanup];
     self.sampleRate = rate;
     self.generation = args[@"generation"] ? [args[@"generation"] unsignedLongLongValue] : self.generation + 1;
@@ -245,6 +250,8 @@ static OSStatus RenderCallback(void *, AudioUnitRenderActionFlags *, const Audio
             NSString *method = call.method;
             if ([method isEqualToString:@"clock"]) {
                 result(@((uint64_t)(mach_absolute_time() * _hostTicksToNs)));
+            } else if ([method isEqualToString:@"claim"]) {
+                result(@(PcmClaimsTake(&_claims)));
             } else if ([method isEqualToString:@"setup"] || [method isEqualToString:@"setupOutput"]) {
                 BOOL legacy = [method isEqualToString:@"setup"];
                 FlutterError *error = [self setup:args legacy:legacy];
@@ -255,8 +262,6 @@ static OSStatus RenderCallback(void *, AudioUnitRenderActionFlags *, const Audio
                     result(@NO); return;
                 }
                 [self cleanup]; result(@YES);
-            } else if ([method isEqualToString:@"setLogLevel"]) {
-                result(@YES);
             } else if ([method isEqualToString:@"setFeedThreshold"]) {
                 self.threshold = MAX(0, [args[@"feed_threshold"] integerValue]); result(@YES);
             } else if ([method isEqualToString:@"status"] || [method isEqualToString:@"feed"]) {
