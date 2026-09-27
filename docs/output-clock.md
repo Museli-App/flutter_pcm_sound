@@ -5,11 +5,14 @@ anchor, sample rate and actual output route identifier. Queue consumption remain
 separate from timestamp validity.
 
 - Android uses `AudioTrack.getTimestamp`. Its wrapping 32-bit frame position is
-  extended against written frames. Polling starts at 100 ms, then slows to 10 s
-  after advancing readings. Route changes and underruns invalidate the cached
-  anchor. The routed device is re-read only after AudioTrack's routing listener
-  fires (or while unrouted), not on every status. No playback-head fallback is
-  presented as hardware timing.
+  extended against written frames. It is polled every 100 ms for the track's
+  life and every reading is published (a failed poll keeps the last): raw
+  readings jitter and a restarted track's first ones can lag by seconds, so the
+  consumer judges them. A track that has played all it was fed pauses, with no
+  anchor, and plays again on the next feed; `starts` counts each play, so a
+  consumer restarts its timing there. The routed device is re-read only after
+  AudioTrack's routing listener fires (or while unrouted), not on every status.
+  No playback-head fallback is presented as hardware timing.
 - iOS publishes the callback's `AudioTimeStamp.mHostTime` with the first PCM
   frame it reads from the ring. Atomic versioned snapshots avoid blocking or
   allocating in the callback. Silence-only callbacks invalidate the anchor.

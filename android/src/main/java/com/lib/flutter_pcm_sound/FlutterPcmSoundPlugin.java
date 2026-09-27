@@ -11,7 +11,6 @@ import android.os.Looper;
 import androidx.annotation.NonNull;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Objects;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
@@ -134,9 +133,9 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
     }
 
     private final class Output {
-        // Poll fast until timestamps advance, then rarely: the anchor only drifts slowly.
-        private static final long FAST_POLL_NS = 100_000_000L, STABLE_POLL_NS = 10_000_000_000L;
-        private static final int STABLE_READINGS = 2;
+        // Every reading is published: the consumer judges them, as raw readings jitter and a restart's
+        // first ones can lag by seconds.
+        private static final long TIMESTAMP_POLL_NS = 100_000_000L;
         final Object lock = new Object();
         final long generation;
         final AudioTrack track;
@@ -147,8 +146,9 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         long timestampFrame = -1;
         long timestampNs;
         long timestampPollNs;
-        int stableTimestamps;
-        int timingUnderruns;
+        // play() calls: a drained track pauses, so a consumer restarts its timing on each start.
+        long starts;
+        boolean paused;
         String routeId;
         volatile boolean routeDirty = true; // set by the routing listener: status re-reads the route once
         // AudioRouting's type, so registration skips the deprecated AudioTrack overload.
@@ -235,38 +235,48 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 updateTimestamp();
                 result.put("sample_rate", sampleRate);
                 result.put("output_route", routeId);
+                result.put("starts", starts);
                 result.put("timestamp_frame", timestampFrame < 0 ? null : timestampFrame);
                 result.put("timestamp_ns", timestampFrame < 0 ? null : timestampNs);
                 return result;
             }
         }
 
+        // The latest reading while the track plays: a failed poll keeps the last, a pause clears it, so a
+        // restarted track publishes nothing until it reads afresh.
         private void updateTimestamp() {
-            if (!running || stopping || failure != null) { timestampFrame = -1; return; }
-            String currentRoute = routeId;
+            if (!running || stopping || paused || failure != null) { timestampFrame = -1; return; }
             // Re-read only after a routing change, or while unrouted: registration follows play().
-            if (routeDirty || currentRoute == null) {
+            if (routeDirty || routeId == null) {
                 routeDirty = false;
                 AudioDeviceInfo route = track.getRoutedDevice();
-                currentRoute = route == null ? null : route.getType() + ":" + route.getId();
-            }
-            if (!Objects.equals(routeId, currentRoute) || underruns != timingUnderruns) {
-                routeId = currentRoute;
-                timingUnderruns = underruns;
-                timestampFrame = -1;
-                stableTimestamps = 0;
-                timestampPollNs = 0;
+                routeId = route == null ? null : route.getType() + ":" + route.getId();
             }
             long now = System.nanoTime();
-            long interval = stableTimestamps >= STABLE_READINGS ? STABLE_POLL_NS : FAST_POLL_NS;
-            if (now - timestampPollNs < interval) return;
+            if (now - timestampPollNs < TIMESTAMP_POLL_NS) return;
             timestampPollNs = now;
-            if (!track.getTimestamp(timestamp)) { timestampFrame = -1; stableTimestamps = 0; return; }
+            if (!track.getTimestamp(timestamp)) return;
             long frame = PcmTimestamp.extend(timestamp.framePosition, written);
             if (frame < 0 || timestamp.nanoTime <= 0) return;
-            if (frame > timestampFrame && timestamp.nanoTime > timestampNs) stableTimestamps++;
             timestampFrame = frame;
             timestampNs = timestamp.nanoTime;
+        }
+
+        // Under lock. A playing track that is fed nothing underruns every mixer cycle and is disabled;
+        // pausing it once its buffer has played keeps its restart, and its timestamps, the framework's.
+        private void pauseDrained() {
+            if (paused || stopping) return;
+            track.pause();
+            paused = true;
+            timestampFrame = -1;
+        }
+
+        private void playIfPaused() {
+            if (!paused) return;
+            track.play();
+            paused = false;
+            starts++;
+            timestampPollNs = 0;
         }
 
         void close() {
@@ -308,10 +318,13 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
                 track.play();
                 track.addOnRoutingChangedListener(routing, main);
-                synchronized (lock) { running = true; }
+                synchronized (lock) { running = true; starts = 1; }
                 while (!stopping) {
                     if (!pump.hasPending()) {
-                        synchronized (lock) { pump.refill(queue); }
+                        synchronized (lock) {
+                            pump.refill(queue);
+                            if (pump.hasPending()) playIfPaused();
+                        }
                     }
                     if (pump.hasPending()) {
                         int count = pump.write(sink);
@@ -320,7 +333,11 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                         if (count == 0) Thread.sleep(2);
                     } else {
                         synchronized (lock) {
-                            if (!stopping && queue.frames() == 0) lock.wait(accepted == consumed ? 0 : 10);
+                            if (!stopping && queue.frames() == 0) {
+                                boolean drained = accepted == consumed;
+                                if (drained) pauseDrained();
+                                lock.wait(drained ? 0 : 10);
+                            }
                         }
                     }
                     if (!stopping) { updateConsumed(); notifyLegacy(); }

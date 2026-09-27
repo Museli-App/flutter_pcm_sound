@@ -27,6 +27,9 @@ class PcmOutputStatus {
   final String? failure;
   final int? sampleRate;
   final String? outputRoute;
+  /// Times the native output has started playing: Android pauses a drained
+  /// track and restarts it on the next feed, and each restart re-times it.
+  final int starts;
   final PcmPresentationTimestamp? presentation;
 
   const PcmOutputStatus({
@@ -40,6 +43,7 @@ class PcmOutputStatus {
     this.failure,
     this.sampleRate,
     this.outputRoute,
+    this.starts = 0,
     this.presentation,
   });
 
@@ -56,6 +60,7 @@ class PcmOutputStatus {
         failure: map['failure'] as String?,
         sampleRate: map['sample_rate'] as int?,
         outputRoute: map['output_route'] as String?,
+        starts: (map['starts'] as int?) ?? 0,
         presentation: PcmPresentationTimestamp.fromMap(map,
             clockOffsetNs: clockOffsetNs),
       );

@@ -135,6 +135,10 @@ void main() {
   test('unavailable native timestamps remain unavailable', () {
     expect(PcmOutputStatus.fromMap(status).presentation, isNull);
   });
+  test('starts counts native plays, and is 0 where a platform sends none', () {
+    expect(PcmOutputStatus.fromMap(status).starts, 0);
+    expect(PcmOutputStatus.fromMap({...status, 'starts': 3}).starts, 3);
+  });
 
   test('release during clock synchronization cannot create a late output',
       () async {
