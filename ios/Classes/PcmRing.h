@@ -73,7 +73,8 @@ static inline bool PcmIdleExpired(PcmIdle *idle, uint64_t written, uint64_t read
     return ++idle->ticks >= graceTicks;
 }
 
-// One underrun per starvation episode, as Android's getUnderrunCount counts them.
+// One underrun per starvation episode, idle drains included. Android reports getUnderrunCount
+// instead, and pauses a track left unfed for the idle grace.
 static inline bool PcmUnderrunEdge(_Atomic(bool) *starved, size_t read, size_t requested) {
     bool starving = read < requested;
     bool was = atomic_exchange_explicit(starved, starving, memory_order_relaxed);

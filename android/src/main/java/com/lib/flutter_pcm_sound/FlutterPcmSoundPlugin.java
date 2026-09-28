@@ -9,6 +9,7 @@ import android.media.AudioDeviceInfo;
 import android.os.Handler;
 import android.os.Looper;
 import androidx.annotation.NonNull;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
@@ -54,7 +55,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
     @Override public void onMethodCall(@NonNull MethodCall call, @NonNull MethodChannel.Result result) {
         synchronized (lifecycle) {
             try {
-                if (!attached) throw new IllegalStateException("Plugin detached");
+                if (!attached) throw new PcmError(PcmError.DETACHED, "Plugin detached");
                 switch (call.method) {
                     case "setup":
                     case "setupOutput": {
@@ -66,7 +67,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                             throw new IllegalArgumentException("Invalid PCM format or capacity");
                         // A setup begun before a newer claim must not replace that owner.
                         if (!claims.admit(call.hasArgument("owner") ? number(call, "owner", 0) : null))
-                            throw new SupersededException();
+                            throw new PcmError(PcmError.SUPERSEDED, "A newer setup claimed the output");
                         release();
                         long generation = call.hasArgument("generation") ? number(call, "generation", 0) : ++nextGeneration;
                         boolean legacy = call.method.equals("setup");
@@ -99,20 +100,25 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                         result.success(true); break;
                     default: result.notImplemented();
                 }
-            } catch (CapacityException e) {
-                result.error("Capacity", e.getMessage(), null);
-            } catch (SupersededException e) {
-                result.error("Superseded", e.getMessage(), null);
+            } catch (PcmError e) {
+                result.error(e.code, e.getMessage(), details());
+            } catch (IllegalArgumentException e) {
+                result.error(PcmError.ARGUMENTS, e.getMessage(), details());
             } catch (Exception e) {
-                result.error("PcmOutput", e.toString(), null);
+                // A failed or stopped output, as iOS names it.
+                result.error(PcmError.AUDIO_UNIT, e.toString(), details());
             }
         }
     }
 
+    private Map<String, Object> details() {
+        return output == null ? null : Collections.singletonMap("generation", output.generation);
+    }
+
     private Output requireOutput(MethodCall call) {
-        if (output == null) throw new IllegalStateException("Must call setup first");
+        if (output == null) throw new PcmError(PcmError.SETUP, "Must call setup first");
         if (number(call, "generation", output.generation) != output.generation)
-            throw new IllegalStateException("Stale output generation");
+            throw new PcmError(PcmError.GENERATION, "Stale output generation");
         return output;
     }
 
@@ -124,18 +130,15 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         output = null;
     }
 
-    private static final class CapacityException extends IllegalStateException {
-        CapacityException() { super("PCM capacity exceeded"); }
-    }
-
-    private static final class SupersededException extends IllegalStateException {
-        SupersededException() { super("A newer setup claimed the output"); }
+    /** A failure under its channel code, shared with iOS (docs/output-clock.md). */
+    private static final class PcmError extends IllegalStateException {
+        static final String ARGUMENTS = "Arguments", SETUP = "Setup", GENERATION = "Generation",
+                CAPACITY = "Capacity", SUPERSEDED = "Superseded", AUDIO_UNIT = "AudioUnitError", DETACHED = "Detached";
+        final String code;
+        PcmError(String code, String message) { super(message); this.code = code; }
     }
 
     private final class Output {
-        // Every reading is published: the consumer judges them, as raw readings jitter and a restart's
-        // first ones can lag by seconds.
-        private static final long TIMESTAMP_POLL_NS = 100_000_000L;
         final Object lock = new Object();
         final long generation;
         final AudioTrack track;
@@ -143,13 +146,7 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
         final int frameBytes;
         final int sampleRate;
         final AudioTimestamp timestamp = new AudioTimestamp();
-        long timestampFrame = -1;
-        long timestampNs;
-        long timestampPollNs;
-        // play() calls: a drained track pauses, so a consumer restarts its timing on each start.
-        long starts;
-        boolean paused;
-        String routeId;
+        final PcmDrain drain = new PcmDrain(); // guarded by lock
         volatile boolean routeDirty = true; // set by the routing listener: status re-reads the route once
         // AudioRouting's type, so registration skips the deprecated AudioTrack overload.
         final AudioRouting.OnRoutingChangedListener routing = router -> routeDirty = true;
@@ -210,7 +207,8 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 if (bytes == null || bytes.length % frameBytes != 0)
                     throw new IllegalArgumentException("PCM data is not frame aligned");
                 int frames = bytes.length / frameBytes;
-                if (accepted - consumed + frames > capacityFrames || !queue.offer(bytes)) throw new CapacityException();
+                if (accepted - consumed + frames > capacityFrames || !queue.offer(bytes))
+                    throw new PcmError(PcmError.CAPACITY, "PCM capacity exceeded");
                 accepted += frames;
                 feeds++;
                 lock.notifyAll();
@@ -234,49 +232,27 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 result.put("failure", failure);
                 updateTimestamp();
                 result.put("sample_rate", sampleRate);
-                result.put("output_route", routeId);
-                result.put("starts", starts);
-                result.put("timestamp_frame", timestampFrame < 0 ? null : timestampFrame);
-                result.put("timestamp_ns", timestampFrame < 0 ? null : timestampNs);
+                result.put("output_route", drain.route());
+                result.put("starts", drain.starts());
+                boolean anchored = drain.anchorFrame() >= 0;
+                result.put("timestamp_frame", anchored ? drain.anchorFrame() : null);
+                result.put("timestamp_ns", anchored ? drain.anchorNs() : null);
                 return result;
             }
         }
 
-        // The latest reading while the track plays: a failed poll keeps the last, a pause clears it, so a
-        // restarted track publishes nothing until it reads afresh.
+        // Every reading is published while the track plays: the consumer judges them, as raw readings
+        // jitter and a restart's first ones can lag by seconds.
         private void updateTimestamp() {
-            if (!running || stopping || paused || failure != null) { timestampFrame = -1; return; }
+            if (!drain.playing(running && !stopping && failure == null)) return;
             // Re-read only after a routing change, or while unrouted: registration follows play().
-            if (routeDirty || routeId == null) {
+            if (routeDirty || drain.route() == null) {
                 routeDirty = false;
                 AudioDeviceInfo route = track.getRoutedDevice();
-                routeId = route == null ? null : route.getType() + ":" + route.getId();
+                drain.routed(route == null ? null : route.getType() + ":" + route.getId());
             }
-            long now = System.nanoTime();
-            if (now - timestampPollNs < TIMESTAMP_POLL_NS) return;
-            timestampPollNs = now;
-            if (!track.getTimestamp(timestamp)) return;
-            long frame = PcmTimestamp.extend(timestamp.framePosition, written);
-            if (frame < 0 || timestamp.nanoTime <= 0) return;
-            timestampFrame = frame;
-            timestampNs = timestamp.nanoTime;
-        }
-
-        // Under lock. A playing track that is fed nothing underruns every mixer cycle and is disabled;
-        // pausing it once its buffer has played keeps its restart, and its timestamps, the framework's.
-        private void pauseDrained() {
-            if (paused || stopping) return;
-            track.pause();
-            paused = true;
-            timestampFrame = -1;
-        }
-
-        private void playIfPaused() {
-            if (!paused) return;
-            track.play();
-            paused = false;
-            starts++;
-            timestampPollNs = 0;
+            if (drain.pollDue(System.nanoTime()) && track.getTimestamp(timestamp))
+                drain.reading(PcmTimestamp.extend(timestamp.framePosition, written), timestamp.nanoTime);
         }
 
         void close() {
@@ -318,12 +294,12 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
                 track.play();
                 track.addOnRoutingChangedListener(routing, main);
-                synchronized (lock) { running = true; starts = 1; }
+                synchronized (lock) { running = true; drain.started(); }
                 while (!stopping) {
                     if (!pump.hasPending()) {
                         synchronized (lock) {
                             pump.refill(queue);
-                            if (pump.hasPending()) playIfPaused();
+                            if (drain.resume(pump.hasPending(), stopping)) track.play();
                         }
                     }
                     if (pump.hasPending()) {
@@ -334,9 +310,11 @@ public class FlutterPcmSoundPlugin implements FlutterPlugin, MethodChannel.Metho
                     } else {
                         synchronized (lock) {
                             if (!stopping && queue.frames() == 0) {
-                                boolean drained = accepted == consumed;
-                                if (drained) pauseDrained();
-                                lock.wait(drained ? 0 : 10);
+                                // A track fed nothing underruns and the framework disables it; pausing it
+                                // after the grace keeps its restart, and its timestamps, the framework's.
+                                long now = System.nanoTime();
+                                if (drain.pauseDue(accepted == consumed, feeds, stopping, now)) track.pause();
+                                lock.wait(drain.waitMs(now));
                             }
                         }
                     }

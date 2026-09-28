@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:async';
 import 'dart:developer' show Timeline;
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart';
 
 enum LogLevel { none, error, standard, verbose }
@@ -14,6 +15,41 @@ enum IosAudioCategory {
   playAndRecord, //
 }
 
+/// Native error codes, alike on Android and iOS (Memory and AVAudioSessionError
+/// are iOS only); see docs/output-clock.md.
+class PcmErrorCode {
+  PcmErrorCode._();
+  static const arguments = 'Arguments';
+  static const setup = 'Setup';
+  static const generation = 'Generation';
+  static const capacity = 'Capacity';
+  static const superseded = 'Superseded';
+  static const audioUnit = 'AudioUnitError';
+  static const memory = 'Memory';
+  static const audioSession = 'AVAudioSessionError';
+  static const detached = 'Detached';
+}
+
+/// Native clock ns onto Timeline.now µs: the midpoint of the shortest of
+/// [samples] round trips. flutter_audio_capture keeps the same estimator.
+@visibleForTesting
+Future<int> timelineOffsetUs(Future<int?> Function() nativeClockNs,
+    {int samples = 5}) async {
+  int? offsetNs;
+  var bestRoundTripUs = 0;
+  for (var sample = 0; sample < samples; sample++) {
+    final beforeUs = Timeline.now;
+    final nativeNs = await nativeClockNs();
+    final afterUs = Timeline.now;
+    if (nativeNs == null) throw StateError('Native clock unavailable');
+    if (offsetNs == null || afterUs - beforeUs < bestRoundTripUs) {
+      bestRoundTripUs = afterUs - beforeUs;
+      offsetNs = (beforeUs + afterUs) * 500 - nativeNs;
+    }
+  }
+  return offsetNs! ~/ 1000;
+}
+
 /// A snapshot of one native output generation. Counters never include rejected feeds.
 class PcmOutputStatus {
   final int generation;
@@ -22,13 +58,14 @@ class PcmOutputStatus {
   final int capacityFrames;
   final int nativeBufferFrames;
   final int totalFeeds;
-  /// Starvation episodes since setup, counted as Android's getUnderrunCount counts them.
+  /// Starvation episodes since setup: iOS counts each, idle drains included;
+  /// Android reads getUnderrunCount, whose unfed track pauses after 500 ms.
   final int underruns;
   final String? failure;
   final int? sampleRate;
   final String? outputRoute;
-  /// Times the native output has started playing: Android pauses a drained
-  /// track and restarts it on the next feed, and each restart re-times it.
+  /// Android play() calls: a track unfed for 500 ms pauses until the next feed,
+  /// so timing restarts there. 0 on iOS, whose unit anchors from each callback.
   final int starts;
   final PcmPresentationTimestamp? presentation;
 
@@ -99,8 +136,6 @@ class FlutterPcmSound {
 
   static Function(int)? onFeedSamplesCallback;
 
-  static Function(int remainingFrames, int totalFeeds)? onFeedTelemetryCallback;
-
   static LogLevel _logLevel = LogLevel.standard;
 
   static bool _needsStart = true;
@@ -108,22 +143,6 @@ class FlutterPcmSound {
   static int? _requestedGeneration;
   static int? _clockGeneration;
   static int? _clockOffsetNs;
-
-  static Future<int> _synchronizeClock() async {
-    int? offset;
-    var bestRoundTripNs = 0;
-    for (var sample = 0; sample < 5; sample++) {
-      final beforeNs = Timeline.now * 1000;
-      final nativeNs = await _nativeClockNs();
-      final afterNs = Timeline.now * 1000;
-      // The shortest round trip gives the tightest offset.
-      if (offset == null || afterNs - beforeNs < bestRoundTripNs) {
-        bestRoundTripNs = afterNs - beforeNs;
-        offset = (beforeNs + afterNs) ~/ 2 - nativeNs;
-      }
-    }
-    return offset!;
-  }
 
   static PcmOutputStatus _decodeStatus(Map<dynamic, dynamic> map) {
     // Only the current generation's exchange maps its timestamps.
@@ -135,8 +154,7 @@ class FlutterPcmSound {
   }
 
   /// Exchanges the same monotonic clock used by output timestamps.
-  static Future<int> _nativeClockNs() async =>
-      (await _invokeMethod<int>('clock'))!;
+  static Future<int?> _nativeClockNs() => _invokeMethod<int>('clock');
 
   /// Takes the newest native claim: an owned setup is refused once a newer one exists.
   static Future<int> _claim() async => (await _invokeMethod<int>('claim'))!;
@@ -193,9 +211,9 @@ class FlutterPcmSound {
     // Claimed before the clock sync, so the setup begun last wins across isolates.
     final owner = await _claim();
     if (revision != _setupRevision) throw StateError('PCM setup cancelled');
-    final offsetNs = await _synchronizeClock();
+    final offsetUs = await timelineOffsetUs(_nativeClockNs);
     if (revision != _setupRevision) throw StateError('PCM setup cancelled');
-    _clockOffsetNs = offsetNs;
+    _clockOffsetNs = offsetUs * 1000;
     _clockGeneration = generation;
     final reply = await _invokeMethod<Map<dynamic, dynamic>>('setupOutput', {
       'sample_rate': sampleRate,
@@ -265,16 +283,6 @@ class FlutterPcmSound {
     _channel.setMethodCallHandler(_methodCallHandler);
   }
 
-  /// As [setFeedCallback], plus `totalFeeds`: how many `feed()` calls since `setup`
-  /// the frame count includes, so a caller whose feeds outrun the callback can add
-  /// back the ones a reading missed. Native readings only: [start] never invokes it.
-  static void setFeedTelemetryCallback(
-    Function(int remainingFrames, int totalFeeds)? callback,
-  ) {
-    onFeedTelemetryCallback = callback;
-    _channel.setMethodCallHandler(_methodCallHandler);
-  }
-
   /// convenience function:
   ///   * if needed, invokes your feed callback to start playback
   ///   * returns true if your callback was invoked
@@ -331,10 +339,6 @@ class FlutterPcmSound {
         _needsStart = remainingFrames == 0;
         if (onFeedSamplesCallback != null) {
           onFeedSamplesCallback!(remainingFrames);
-        }
-        if (onFeedTelemetryCallback != null) {
-          int totalFeeds = call.arguments["total_feeds"];
-          onFeedTelemetryCallback!(remainingFrames, totalFeeds);
         }
         break;
       default:

@@ -193,6 +193,34 @@ FlutterPcmSound.setFeedCallback(onFeed);
 FlutterPcmSound.start(); // for convenience. Equivalent to calling onFeed(0);
 ```
 
+## Receipt API
+
+`setupOutput` creates a bounded output with no unsolicited callbacks, so it
+works from a registered background isolate. Every call names the output's
+`generation`, and every reply is a `PcmOutputStatus` receipt.
+
+```dart
+await FlutterPcmSound.setupOutput(
+    sampleRate: 48000, channelCount: 1, generation: 1, capacityFrames: 5120);
+final receipt = await FlutterPcmSound.feedWithStatus(samples, generation: 1);
+final latest = await FlutterPcmSound.status(generation: 1);
+await FlutterPcmSound.release(generation: 1);
+```
+
+- `setupOutput` first takes a native claim and sends it as its `owner`; a setup
+  whose claim a newer one replaced fails with `Superseded`, so the setup begun
+  last wins across isolates.
+- A feed past `capacityFrames` fails with `Capacity`, and a stale generation
+  with `Generation`; nothing rejected is counted. `release(generation:)`
+  releases only that generation.
+- Status keys: `generation`, `accepted_frames`, `consumed_frames`,
+  `remaining_frames`, `capacity_frames`, `native_buffer_frames`, `total_feeds`,
+  `underruns`, `starts`, `failure`, `sample_rate`, `output_route`,
+  `timestamp_frame` and `timestamp_ns`.
+
+Timing, `starts`, `underruns` and the error codes (`PcmErrorCode`) are in
+[docs/output-clock.md](docs/output-clock.md).
+
 ## ⭐ Stars ⭐
 
 Please star this repo & on [pub.dev](https://pub.dev/packages/flutter_pcm_sound). We all benefit from having a larger community.

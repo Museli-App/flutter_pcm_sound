@@ -16,12 +16,14 @@ javac -d /tmp/pcm-tests \
   android/src/main/java/com/lib/flutter_pcm_sound/PcmWritePump.java \
   android/src/main/java/com/lib/flutter_pcm_sound/PcmWorkerShutdown.java \
   android/src/main/java/com/lib/flutter_pcm_sound/PcmClaims.java \
+  android/src/main/java/com/lib/flutter_pcm_sound/PcmDrain.java \
   test/native/com/lib/flutter_pcm_sound/*.java
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmTimestampTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmHeadTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmQueueTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmWritePumpTest
 java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmClaimsTest
+java -cp /tmp/pcm-tests com.lib.flutter_pcm_sound.PcmDrainTest
 flutter test
 ```
 
@@ -30,8 +32,11 @@ concurrent producer/consumer transfers, the idle-stop grace and one underrun per
 starvation episode. JVM tests check the widened, capped playback head, frame
 alignment, bounded storage, short/zero writes, dead-track/error returns,
 preserved tails, cleanup through exceptions and bounded shutdown. JVM and C claim tests check that
-only the newest owned setup is admitted and an unowned one claims afresh. Method-channel tests cover generation
-receipts, byte-view offsets/lengths, validation and rejected feeds.
+only the newest owned setup is admitted and an unowned one claims afresh. The JVM drain test checks that a
+track left drained and unfed pauses only after the grace (a feed or playing frames restart it), a refill plays
+it again and counts a start unless stopping, and the timestamp anchor is polled at most every 100 ms, keeps its
+last reading within a route and clears on a pause, a route change or while not playing. Method-channel tests
+cover generation receipts, byte-view offsets/lengths, validation, rejected feeds and the clock estimator.
 
 These are host regressions, not measurements of AudioTrack/AudioUnit behavior on
 physical devices. Setup, route changes, interruptions, latency and long-run CPU,

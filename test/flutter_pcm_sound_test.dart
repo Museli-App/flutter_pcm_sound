@@ -37,7 +37,6 @@ void main() {
   });
   tearDown(() {
     FlutterPcmSound.setFeedCallback(null);
-    FlutterPcmSound.setFeedTelemetryCallback(null);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
   });
@@ -86,7 +85,7 @@ void main() {
   test('a rejected feed stays an error', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (_) async {
-          throw PlatformException(code: 'Capacity');
+          throw PlatformException(code: PcmErrorCode.capacity);
         });
     await expectLater(
       FlutterPcmSound.feedWithStatus(
@@ -134,6 +133,21 @@ void main() {
   });
   test('unavailable native timestamps remain unavailable', () {
     expect(PcmOutputStatus.fromMap(status).presentation, isNull);
+  });
+  test('the clock offset keeps the shortest round trip', () async {
+    // flutter_audio_capture pins its estimator on the same samples.
+    var exchanges = 0;
+    final offsetUs = await timelineOffsetUs(() async {
+      // The slow first exchange reads 5 s off; a fast one must win.
+      if (exchanges++ == 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        return Timeline.now * 1000 + 14000000000;
+      }
+      return Timeline.now * 1000 + 9000000000;
+    });
+    expect(exchanges, 5);
+    expect(offsetUs, closeTo(-9000000, 2000));
+    await expectLater(timelineOffsetUs(() async => null), throwsStateError);
   });
   test('starts counts native plays, and is 0 where a platform sends none', () {
     expect(PcmOutputStatus.fromMap(status).starts, 0);
@@ -212,7 +226,7 @@ void main() {
       if (call.method == 'claim') return 7;
       if (call.method == 'clock') return Timeline.now * 1000;
       if (call.method == 'setupOutput') {
-        throw PlatformException(code: 'Superseded');
+        throw PlatformException(code: PcmErrorCode.superseded);
       }
       return null;
     });
@@ -220,7 +234,7 @@ void main() {
       FlutterPcmSound.setupOutput(
           sampleRate: 48000, channelCount: 1, generation: 91),
       throwsA(isA<PlatformException>()
-          .having((error) => error.code, 'code', 'Superseded')),
+          .having((error) => error.code, 'code', PcmErrorCode.superseded)),
     );
     expect(calls.last.method, 'setupOutput');
     expect(calls.where((call) => call.method == 'release'), isEmpty);
